@@ -84,11 +84,18 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
                           out.numel());
       break;
     }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)) && !defined USE_ROCM
     case at::ScalarType::BFloat16: {
       fa->allreduce<nv_bfloat16>(
           stream, reinterpret_cast<nv_bfloat16 *>(inp.data_ptr()),
           reinterpret_cast<nv_bfloat16 *>(out.data_ptr()), out.numel());
+      break;
+    }
+#elif defined USE_ROCM
+    case at::ScalarType::BFloat16: {
+      fa->allreduce<__hip_bfloat16>(
+          stream, reinterpret_cast<__hip_bfloat16 *>(inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16 *>(out.data_ptr()), out.numel());
       break;
     }
 #endif

@@ -9,12 +9,14 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 
 try:
-    import pynvml
-
     from vllm._C import custom_ar
 except ImportError:
-    # For AMD GPUs
     custom_ar = None
+
+try:
+    import pynvml
+except ImportError:
+    # For AMD GPUs
     pynvml = None
 
 logger = init_logger(__name__)

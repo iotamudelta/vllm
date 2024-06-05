@@ -187,6 +187,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/custom_all_reduce.cu")
 endif()
 
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  list(APPEND VLLM_EXT_SRC
+    "csrc/custom_all_reduce.cu")
+endif()
+
 define_gpu_extension_target(
   _C
   DESTINATION vllm

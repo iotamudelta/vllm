@@ -4,6 +4,10 @@
  * export MPI_HOME=XXX
  * nvcc -O2 -arch=native -std=c++17 custom_all_reduce_test.cu -o
  * custom_all_reduce_test -lnccl -I${MPI_HOME}/include -lmpi
+ * to hipify and compile
+ * export MPI_HOME=XXX
+ * hipify-perl custom_all_reduce_test.cu > custom_all_reduce_test.hip
+ * hipcc -O2 -std=c++17 custom_all_reduce_test.hip -o custom_all_reduce_test -lrccl -I${MPI_HOME}/include -L${MPI_HOME}/lib -lmpi -DUSE_ROCM=1
  *
  * Warning: this C++ test is not designed to be very readable and was used
  * during the rapid prototyping process.
@@ -12,7 +16,11 @@
  * mpirun -np 8 ./custom_all_reduce_test
  */
 #include <cuda.h>
+#ifndef USE_ROCM
 #include <curand_kernel.h>
+#else
+#include <hiprand/hiprand_kernel.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -20,9 +28,17 @@
 #include <vector>
 
 #include "cuda_profiler_api.h"
+#ifndef USE_ROCM
 #include "custom_all_reduce.cuh"
+#else
+#include "custom_all_reduce_hip.cuh"
+#endif
 #include "mpi.h"
+#ifndef USE_ROCM
 #include "nccl.h"
+#else
+#include <rccl/rccl.h>
+#endif
 
 #define MPICHECK(cmd)                                                  \
   do {                                                                 \
@@ -44,7 +60,12 @@
   } while (0)
 
 __global__ void dummy_kernel() {
+#ifndef USE_ROCM
   for (int i = 0; i < 100; i++) __nanosleep(1000000);  // 100ms
+#else
+  #pragma unroll
+  for (int i = 0; i < 100; i++) __builtin_amdgcn_s_sleep(127);
+#endif
 }
 
 template <typename T>
@@ -164,7 +185,11 @@ void run(int myRank, int nRanks, ncclComm_t &comm, int threads, int block_limit,
   ncclDataType_t ncclDtype;
   if (std::is_same<T, half>::value) {
     ncclDtype = ncclFloat16;
+#ifndef USE_ROCM
   } else if (std::is_same<T, nv_bfloat16>::value) {
+#else
+  } else if (std::is_same<T, __hip_bfloat16>::value) {
+#endif
     ncclDtype = ncclBfloat16;
   } else {
     ncclDtype = ncclFloat;
@@ -308,9 +333,14 @@ int main(int argc, char **argv) {
   //   }
   // }
   for (int sz = 512; sz <= (8 << 20); sz *= 2) {
+#ifndef USE_ROCM
     run<half>(myRank, nRanks, comm, 512, 36, sz + 8 * 47, performance_test);
+#else
+    run<half>(myRank, nRanks, comm, 1024, 16, sz + 8 * 47, performance_test);
+#endif
   }
 
   cudaProfilerStop();
+  MPICHECK(MPI_Finalize());
   return EXIT_SUCCESS;
 }

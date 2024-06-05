@@ -112,7 +112,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     &get_max_shared_memory_per_block_device_attribute,
     "Gets the maximum shared memory per block device attribute.");
 
-#ifndef USE_ROCM
   // Custom all-reduce kernels
   pybind11::module custom_ar = m.def_submodule("custom_ar", "custom allreduce");
   custom_ar.def("init_custom_ar", &init_custom_ar, "init_custom_ar");
@@ -126,6 +125,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 "get_graph_buffer_ipc_meta");
   custom_ar.def("register_graph_buffers", &register_graph_buffers,
                 "register_graph_buffers");
-#endif
 
 }

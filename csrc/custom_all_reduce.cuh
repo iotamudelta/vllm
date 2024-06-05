@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cuda.h>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/amd_detail/amd_hip_bf16.h>
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -31,9 +35,17 @@ struct Signal {
   alignas(128) uint32_t end[kMaxBlocks][8];
 };
 
+#ifndef USE_ROCM
 struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
+#else
+struct __align__(16) RankData { const void * ptrs[8]; };
+#endif
 
+#ifndef USE_ROCM
 struct __align__(16) RankSignals { volatile Signal *signals[8]; };
+#else
+struct __align__(16) RankSignals { Signal *signals[8]; };
+#endif
 
 // like std::array, but aligned
 template <typename T, int sz>
@@ -74,6 +86,7 @@ DINLINE half &assign_add(half &a, half b) {
 }
 DINLINE float &assign_add(float &a, float b) { return a += b; }
 
+#ifndef USE_ROCM
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
 DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
 template <>
@@ -81,6 +94,17 @@ DINLINE nv_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
 }
 DINLINE nv_bfloat16 &assign_add(nv_bfloat16 &a, nv_bfloat16 b) {
+  a = __hadd(a, b);
+  return a;
+}
+#endif
+#else
+DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
+template <>
+DINLINE __hip_bfloat16 downcast_s(float val) {
+  return __float2bfloat16(val);
+}
+DINLINE __hip_bfloat16 &assign_add(__hip_bfloat16 &a, __hip_bfloat16 b) {
   a = __hadd(a, b);
   return a;
 }
@@ -128,16 +152,30 @@ DINLINE O downcast(array_t<float, O::size> val) {
 // prior memory accesses. Note: volatile writes will not be reordered against
 // other volatile writes.
 template <int ngpus>
+#ifndef USE_ROCM
 DINLINE void start_sync(const RankSignals &sg, volatile Signal *self_sg,
-                        int rank) {
+                int rank) {
+#else
+DINLINE void start_sync(const RankSignals &sg, Signal *self_sg, int rank) {
+#endif
   if (threadIdx.x < ngpus) {
     // reset flag for next time
+#ifndef USE_ROCM
     self_sg->end[blockIdx.x][threadIdx.x] = 0;
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
     sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
     // wait until we got true from all ranks
     while (!self_sg->start[blockIdx.x][threadIdx.x])
+#else
+    __atomic_store_n(&self_sg->end[blockIdx.x][threadIdx.x], 0, __ATOMIC_RELAXED);
+    // simultaneously write to the corresponding flag of all ranks.
+    // Latency = 1 p2p write
+    __atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQ_REL);
+    // wait until we got true from all ranks
+    while (!__atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED))
+#endif
       ;
   }
   __syncthreads();
@@ -147,13 +185,18 @@ DINLINE void start_sync(const RankSignals &sg, volatile Signal *self_sg,
 // barrier in the all reduce kernel. If it's the final synchronization barrier,
 // we don't need to make any visibility guarantees for prior memory accesses.
 template <int ngpus, bool final_sync = false>
+#ifndef USE_ROCM
 DINLINE void end_sync(const RankSignals &sg, volatile Signal *self_sg,
                       int rank) {
+#else
+DINLINE void end_sync(const RankSignals &sg, Signal *self_sg, int rank) {
+#endif
   __syncthreads();
   // eliminate the case that prior writes are not visible after signals become
   // visible. Note that I did not managed to make this happen through a lot of
   // testing. Might be the case that hardware provides stronger guarantee than
   // the memory model. 
+#ifndef USE_ROCM
   if constexpr (!final_sync) __threadfence_system();
   if (threadIdx.x < ngpus) {
     // reset flag for next time
@@ -164,6 +207,18 @@ DINLINE void end_sync(const RankSignals &sg, volatile Signal *self_sg,
     // wait until we got true from all ranks
     while (!self_sg->end[blockIdx.x][threadIdx.x])
       ;
+#else
+  if (threadIdx.x < ngpus) {
+    // reset flag for next time
+    __atomic_store_n(&self_sg->start[blockIdx.x][threadIdx.x], 0, __ATOMIC_RELAXED);
+    // simultaneously write to the corresponding flag of all ranks.
+    // Latency = 1 p2p write
+    __atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQ_REL);
+    // wait until we got true from all ranks
+    while (!__atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED))
+      ;
+#endif
   }
   if constexpr (!final_sync) __syncthreads();
 }
@@ -179,10 +234,16 @@ DINLINE P packed_reduce(const P *ptrs[], int idx) {
 }
 
 template <typename T, int ngpus>
+#ifndef USE_ROCM
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
                                volatile Signal *self_sg, T *__restrict__ result,
                                int rank, int size) {
+#else
+__global__ void __launch_bounds__(1024, 1)
+    cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
+                               Signal *self_sg, T *__restrict__ result, int rank, int size) {
+#endif
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
@@ -199,15 +260,26 @@ __global__ void __launch_bounds__(512, 1)
 }
 
 template <typename P>
+#ifndef USE_ROCM
 DINLINE P *get_tmp_buf(volatile Signal *sg) {
+#else
+DINLINE P *get_tmp_buf(Signal *sg) {
+#endif
   return (P *)(((Signal *)sg) + 1);
 }
 
 template <typename T, int ngpus>
+#ifndef USE_ROCM
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData *_dp, RankSignals sg,
                                volatile Signal *self_sg, T *__restrict__ result,
                                int rank, int size) {
+#else
+__global__ void __launch_bounds__(1024, 1)
+    cross_device_reduce_2stage(RankData *_dp, RankSignals sg,
+                               Signal *self_sg, T *__restrict__ result,
+                               int rank, int size) {
+#endif
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -327,8 +399,12 @@ class CustomAllreduce {
       // note: must share the base address of each allocation, or we get wrong
       // address
       if (cuPointerGetAttribute(&base_ptr,
+#ifndef USE_ROCM
                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
-                                (CUdeviceptr)ptr) != CUDA_SUCCESS)
+#else
+                                HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+#endif
+				(CUdeviceptr)ptr) != CUDA_SUCCESS)
         throw std::runtime_error("failed to get pointer attr");
       CUDACHECK(cudaIpcGetMemHandle(
           (cudaIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));
@@ -406,7 +482,11 @@ class CustomAllreduce {
    */
   template <typename T>
   void allreduce(cudaStream_t stream, T *input, T *output, int size,
+#ifndef USE_ROCM
                  int threads = 512, int block_limit = 36) {
+#else
+                 int threads = 1024, int block_limit = 36) {
+#endif
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
