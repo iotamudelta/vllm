@@ -131,14 +131,8 @@ void run(int myRank, int nRanks, ncclComm_t& comm, int threads, int block_limit,
    * registration, they are allocated and registered together in the test for
    * convenience.
    */
-#ifdef USE_ROCM
-  CUDACHECK(hipExtMallocWithFlags(
-      (void**)&buffer, 2 * data_size * sizeof(T) + sizeof(vllm::Signal),
-      hipDeviceMallocUncached));
-#else
   CUDACHECK(
       cudaMalloc(&buffer, 2 * data_size * sizeof(T) + sizeof(vllm::Signal)));
-#endif
   CUDACHECK(
       cudaMemset(buffer, 0, 2 * data_size * sizeof(T) + sizeof(vllm::Signal)));
   CUDACHECK(cudaMalloc(&self_data_copy, data_size * sizeof(T)));
