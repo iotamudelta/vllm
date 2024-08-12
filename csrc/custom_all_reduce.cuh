@@ -43,11 +43,11 @@ struct __align__(16) RankData { const void* ptrs[8]; };
 struct __align__(16) RankData { const void* __restrict__ ptrs[8]; };
 #endif
 
-#ifdef USE_ROCM
-struct __align__(16) RankSignals { Signal* signals[8]; };
-#else
-struct __align__(16) RankSignals { volatile Signal* signals[8]; };
+struct __align__(16) RankSignals {
+#ifndef USE_ROCM
+  volatile
 #endif
+  Signal* signals[8]; };
 
 // like std::array, but aligned
 template <typename T, int sz>
@@ -234,11 +234,10 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg,
-#ifdef USE_ROCM
-                               Signal* self_sg, T* __restrict__ result,
-#else
-                               volatile Signal* self_sg, T* __restrict__ result,
+#ifndef USE_ROCM
+                               volatile
 #endif
+                               Signal* self_sg, T* __restrict__ result,
 			       int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
@@ -255,22 +254,21 @@ __global__ void __launch_bounds__(512, 1)
 }
 
 template <typename P>
-#ifdef USE_ROCM
-DINLINE P* get_tmp_buf(Signal* sg) {
-#else
-DINLINE P* get_tmp_buf(volatile Signal* sg) {
+DINLINE P* get_tmp_buf(
+#ifndef USE_ROCM
+     volatile
 #endif
+     Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg,
-#ifdef USE_ROCM
-                               Signal* self_sg, T* __restrict__ result,
-#else
-                               volatile Signal* self_sg, T* __restrict__ result,
+#ifndef USE_ROCM
+                               volatile
 #endif
+                               Signal* self_sg, T* __restrict__ result,
                                int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
