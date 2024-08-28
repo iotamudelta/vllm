@@ -43,7 +43,7 @@ struct __align__(16) RankData { const void* ptrs[8]; };
 struct __align__(16) RankData { const void* __restrict__ ptrs[8]; };
 #endif
 
-struct __align__(16) RankSignals { volatile Signal* signals[8]; };
+struct __align__(16) RankSignals { Signal* signals[8]; };
 
 // like std::array, but aligned
 template <typename T, int sz>
@@ -136,9 +136,9 @@ DINLINE O downcast(array_t<float, O::size> val) {
 // This function is meant to be used as the first synchronization in the all
 // reduce kernel. Thus, it doesn't need to make any visibility guarantees for
 // prior memory accesses. Note: volatile writes will not be reordered against
-// other volatile writes.
+// other volatile writes (CUDA ONLY).
 template <int ngpus>
-DINLINE void start_sync(const RankSignals& sg, volatile Signal* self_sg,
+DINLINE void start_sync(const RankSignals& sg, Signal* self_sg,
                         int rank) {
 #ifdef USE_ROCM
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
@@ -172,7 +172,7 @@ DINLINE void start_sync(const RankSignals& sg, volatile Signal* self_sg,
 // barrier in the all reduce kernel. If it's the final synchronization barrier,
 // we don't need to make any visibility guarantees for prior memory accesses.
 template <int ngpus, bool final_sync = false>
-DINLINE void end_sync(const RankSignals& sg, volatile Signal* self_sg,
+DINLINE void end_sync(const RankSignals& sg, Signal* self_sg,
                       int rank) {
 #ifdef USE_ROCM
   __syncthreads();
@@ -227,7 +227,7 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg,
-                               volatile Signal* self_sg, T* __restrict__ result,
+                               Signal* self_sg, T* __restrict__ result,
                                int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
@@ -244,14 +244,14 @@ __global__ void __launch_bounds__(512, 1)
 }
 
 template <typename P>
-DINLINE P* get_tmp_buf(volatile Signal* sg) {
+DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg,
-                               volatile Signal* self_sg, T* __restrict__ result,
+                               Signal* self_sg, T* __restrict__ result,
                                int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
@@ -455,7 +455,7 @@ class CustomAllreduce {
    */
   template <typename T>
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
-                 int threads = 512, int block_limit = 36) {
+                 int threads = 512, int block_limit = 18) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(

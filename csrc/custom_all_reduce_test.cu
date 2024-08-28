@@ -331,9 +331,10 @@ int main(int argc, char** argv) {
   //   }
   // }
   for (int sz = 512; sz <= (8 << 20); sz *= 2) {
-    run<half>(myRank, nRanks, comm, 512, 36, sz + 8 * 47, performance_test);
+    run<half>(myRank, nRanks, comm, 512, 18, sz + 8 * 47, performance_test);
   }
 
   cudaProfilerStop();
+  MPICHECK(MPI_Finalize());
   return EXIT_SUCCESS;
 }
