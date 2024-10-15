@@ -916,8 +916,15 @@ class QKVParallelLinearModified(ColumnParallelLinear):
             assert param_data.shape == loaded_weight.shape
             param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, positions):
         bias = self.bias if not self.skip_bias_add else None
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        positions_as_list = positions.tolist()
+
+        for each_pos in positions_as_list:
+            print("GPU location: ", each_pos, each_pos%tp_size)
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -925,8 +932,6 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
         q_sub, k_sub, v_sub = output_parallel.split([self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size], dim=-1)
 
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
 
         splitted_k = split_tensor_along_last_dim(
             k_sub, num_partitions=self.total_num_kv_heads)
