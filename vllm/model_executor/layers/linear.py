@@ -682,8 +682,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-
-
 class QKVParallelLinearModified(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
@@ -741,7 +739,9 @@ class QKVParallelLinearModified(ColumnParallelLinear):
         self.output_sizes.append(self.num_heads * self.head_size * tp_size)  #q_proj
         for i in range(self.total_num_kv_heads):                               #k_proj
             self.output_sizes.append(self.head_size)    # NO tp_size multiply because we split it across each matrix
-        self.output_sizes.append(self.num_kv_heads * self.head_size * tp_size)  #v_proj
+        for i in range(self.total_num_kv_heads):                               #v_proj
+            self.output_sizes.append(self.head_size)    # NO tp_size multiply because we split it across each matrix
+        #self.output_sizes.append(self.num_kv_heads * self.head_size * tp_size)  #v_proj
         #self.output_sizes = [
         #    self.num_heads * self.head_size * tp_size,  # q_proj
         #    self.num_kv_heads * self.head_size * tp_size,  # k_proj
@@ -844,6 +844,8 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
         if (loaded_shard_id == "k"):
             num_kv_iterations = self.total_num_kv_heads
+        elif (loaded_shard_id == "v"):
+            num_kv_iterations = self.total_num_kv_heads
         else:
             num_kv_iterations = 1
 
@@ -858,8 +860,9 @@ class QKVParallelLinearModified(ColumnParallelLinear):
                     shard_offset = (self.num_heads * self.head_size) + ((kv_head * self.head_size) // tp_size)
                     shard_size = (self.head_size) // tp_size
                 elif loaded_shard_id == "v":
-                    shard_offset = (self.num_heads * self.head_size) + ((self.total_num_kv_heads * self.head_size) // tp_size)
-                    shard_size = self.num_kv_heads * self.head_size
+                    shard_offset = (self.num_heads * self.head_size) + ((self.total_num_kv_heads * self.head_size) // tp_size) + ((kv_head * self.head_size) // tp_size)
+                    shard_size = (self.head_size) // tp_size
+                    #shard_size = self.num_kv_heads * self.head_size
                 # Special case for Quantized Weights.
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
@@ -874,10 +877,11 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
                 param_data = param_unmodified_data.narrow(output_dim, shard_offset,
                                                shard_size)
-                if loaded_shard_id == "v":
-                    shard_id = tp_rank // self.num_kv_head_replicas
-                else:
-                    shard_id = tp_rank
+               # if loaded_shard_id == "v":
+               #     shard_id = tp_rank // self.num_kv_head_replicas
+               # else:
+               #     shard_id = tp_rank
+                shard_id = tp_rank
                 start_idx = (shard_id * shard_size) + (kv_head * shard_size * tp_size)
                 loaded_weight = loaded_unmodified_weight.narrow(output_dim, start_idx,
                                                      shard_size)
@@ -923,8 +927,8 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
         positions_as_list = positions.tolist()
 
-        for each_pos in positions_as_list:
-            print("GPU location: ", each_pos, each_pos%tp_size)
+#        for each_pos in positions_as_list:
+#            print("GPU location: ", each_pos, each_pos%tp_size)
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -936,6 +940,8 @@ class QKVParallelLinearModified(ColumnParallelLinear):
         splitted_k = split_tensor_along_last_dim(
             k_sub, num_partitions=self.total_num_kv_heads)
         #k_slice = splitted_k[tp_rank].contiguous()
+        splitted_v = split_tensor_along_last_dim(
+            v_sub, num_partitions=self.total_num_kv_heads)
 
         #k_gathered = tensor_model_parallel_all_gather(k_slice)
 
@@ -948,7 +954,11 @@ class QKVParallelLinearModified(ColumnParallelLinear):
                 #print(k_gathered.shape, output_par.shape)
 #            if (tp_rank == 0):
 #                print(k_gathered)
-        output_par = torch.cat([output_par, v_sub], dim=-1)
+        for v_h in range(self.total_num_kv_heads):
+            v_gathered = tensor_model_parallel_all_gather(splitted_v[v_h].contiguous())
+            if (tp_rank == (v_h//self.num_kv_heads)):
+                output_par = torch.cat([output_par, v_gathered], dim=-1)
+        #output_par = torch.cat([output_par, v_sub], dim=-1)
 
         if self.gather_output:
             # All-gather across the partitions.
@@ -957,8 +967,6 @@ class QKVParallelLinearModified(ColumnParallelLinear):
             output = output_par
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
-
-
 
 
 class RowParallelLinear(LinearBase):
