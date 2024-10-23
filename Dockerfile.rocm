@@ -58,8 +58,8 @@ FROM export_hipblaslt_${BUILD_HIPBLASLT} AS export_hipblaslt
 # -----------------------
 # RCCL build stages
 FROM base AS build_rccl
-ARG RCCL_BRANCH="rocm-6.2.0"
-RUN git clone https://github.com/ROCm/rccl \
+ARG RCCL_BRANCH="rccl-mscclpp-cpx-mi300"
+RUN git clone https://github.com/nusislam/rccl \
     && cd rccl \
     && git checkout ${RCCL_BRANCH} \
     && ./install.sh -p --amdgpu_targets ${PYTORCH_ROCM_ARCH}
