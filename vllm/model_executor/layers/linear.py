@@ -936,6 +936,21 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
         q_sub, k_sub, v_sub = output_parallel.split([self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size], dim=-1)
 
+        min_num_tokens_per_GPU = q_sub.size(0) // tp_size
+        num_GPUs_with_extra_token = q_sub.size(0) % tp_size
+
+        partition_sizes = []
+        for each_slice in range(tp_size):
+            append_value = 0
+            if (num_GPUs_with_extra_token > 0):
+                append_value = 1
+                num_GPUs_with_extra_token = num_GPUs_with_extra_token - 1
+            append_value = append_value + min_num_tokens_per_GPU
+            partition_sizes.append(append_value)
+
+
+        if (tp_rank == 0):
+            print(partition_sizes)
 
         splitted_k = split_tensor_along_last_dim(
             k_sub, num_partitions=self.total_num_kv_heads)
