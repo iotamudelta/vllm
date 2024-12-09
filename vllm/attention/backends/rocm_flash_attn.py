@@ -1,17 +1,27 @@
 """Attention layer ROCm GPUs."""
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata)
+                                              AttentionMetadata, AttentionType)
+from vllm.attention.backends.utils import (CommonAttentionState,
+                                           CommonMetadataBuilder)
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
 logger = init_logger(__name__)
+
+_PARTITION_SIZE_ROCM = 512
+_ON_NAVI = "gfx1" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 
 class ROCmFlashAttentionBackend(AttentionBackend):
@@ -25,8 +35,16 @@ class ROCmFlashAttentionBackend(AttentionBackend):
         return ROCmFlashAttentionImpl
 
     @staticmethod
-    def make_metadata(*args, **kwargs) -> "ROCmFlashAttentionMetadata":
-        return ROCmFlashAttentionMetadata(*args, **kwargs)
+    def get_metadata_cls() -> Type["AttentionMetadata"]:
+        return ROCmFlashAttentionMetadata
+
+    @staticmethod
+    def get_builder_cls() -> Type["ROCmFlashAttentionMetadataBuilder"]:
+        return ROCmFlashAttentionMetadataBuilder
+
+    @staticmethod
+    def get_state_cls() -> Type["CommonAttentionState"]:
+        return CommonAttentionState
 
     @staticmethod
     def get_kv_cache_shape(
@@ -68,6 +86,17 @@ class ROCmFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
     seq_lens: Optional[List[int]]
     # seq_lens stored as a tensor.
     seq_lens_tensor: Optional[torch.Tensor]
+    # Maximum sequence length among prefill batch. 0 if there are decoding
+    # requests only.
+    max_prefill_seq_len: int
+    # Maximum sequence length among decode batch. 0 if there are prefill
+    # requests only.
+    max_decode_seq_len: int
+
+    # Whether or not if cuda graph is enabled.
+    # Cuda-graph is currently enabled for decoding only.
+    # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
+    use_cuda_graph: bool
 
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
@@ -78,31 +107,44 @@ class ROCmFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
     #                                   |-- query_len ---|
 
     # Maximum query length in the batch. None for decoding.
-    max_query_len: Optional[int]
-    # Maximum sequence length among prefill batch. 0 if there are decoding
-    # requests only.
-    max_prefill_seq_len: int
-    # Maximum sequence length among decode batch. 0 if there are prefill
-    # requests only.
-    max_decode_seq_len: int
+    max_query_len: Optional[int] = None
     # (batch_size + 1,). The cumulative subquery lengths of the sequences in
     # the batch, used to index into subquery. E.g., if the subquery length
     # is [4, 6], it is [0, 4, 10].
-    query_start_loc: Optional[torch.Tensor]
+    query_start_loc: Optional[torch.Tensor] = None
     # (batch_size + 1,). The cumulative sequence lengths of the sequences in
     # the batch, used to index into sequence. E.g., if the sequence length is
     # [4, 6], it is [0, 4, 10].
-    seq_start_loc: Optional[torch.Tensor]
-
-    # Whether or not if cuda graph is enabled.
-    # Cuda-graph is currently enabled for decoding only.
-    # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
-    use_cuda_graph: bool
+    seq_start_loc: Optional[torch.Tensor] = None
     # (batch_size,) A tensor of context lengths (tokens that are computed
     # so far).
-    context_lens_tensor: Optional[torch.Tensor]
+    context_lens_tensor: Optional[torch.Tensor] = None
+
+    # Number of query tokens for each request in the batch.
+    # Currently, we require that all requests have the same number of query
+    # tokens during the decoding phase. When speculavie decoding is enabled,
+    # decode_query_len might be greater than 1. In all other cases, it is 1.
+    decode_query_len: Optional[int] = None
+
     _cached_prefill_metadata: Optional["ROCmFlashAttentionMetadata"] = None
     _cached_decode_metadata: Optional["ROCmFlashAttentionMetadata"] = None
+
+    # Begin encoder attn & enc/dec cross-attn fields...
+
+    # Encoder sequence lengths representation
+    encoder_seq_lens: Optional[List[int]] = None
+    encoder_seq_lens_tensor: Optional[torch.Tensor] = None
+
+    # Maximum sequence length among encoder sequences
+    max_encoder_seq_len: Optional[int] = None
+
+    # Number of tokens input to encoder
+    num_encoder_tokens: Optional[int] = None
+
+    # Cross-attention memory-mapping data structures: slot mapping
+    # and block tables
+    cross_slot_mapping: Optional[torch.Tensor] = None
+    cross_block_tables: Optional[torch.Tensor] = None
 
     @property
     def prefill_metadata(self) -> Optional["ROCmFlashAttentionMetadata"]:
@@ -114,10 +156,7 @@ class ROCmFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
 
         assert self.seq_lens is not None
         assert self.seq_lens_tensor is not None
-        assert self.query_start_loc is not None
-        assert self.context_lens_tensor is not None
         assert self.block_tables is not None
-        assert self.seq_start_loc is not None
 
         self._cached_prefill_metadata = ROCmFlashAttentionMetadata(
             num_prefills=self.num_prefills,
@@ -129,12 +168,20 @@ class ROCmFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
             max_query_len=self.max_query_len,
             max_prefill_seq_len=self.max_prefill_seq_len,
             max_decode_seq_len=0,
-            query_start_loc=self.query_start_loc[:self.num_prefills + 1],
-            seq_start_loc=self.seq_start_loc[:self.num_prefills + 1],
-            context_lens_tensor=self.context_lens_tensor[:self.num_prefills],
+            query_start_loc=None if self.query_start_loc is None else
+            self.query_start_loc[:self.num_prefills + 1],
+            seq_start_loc=None if self.seq_start_loc is None else
+            self.seq_start_loc[:self.num_prefills + 1],
+            context_lens_tensor=None if self.context_lens_tensor is None else
+            self.context_lens_tensor[:self.num_prefills],
             block_tables=self.block_tables[:self.num_prefills],
             use_cuda_graph=False,
-        )
+            # Begin encoder & cross attn fields below...
+            encoder_seq_lens=self.encoder_seq_lens,
+            encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
+            max_encoder_seq_len=self.max_encoder_seq_len,
+            cross_slot_mapping=self.cross_slot_mapping,
+            cross_block_tables=self.cross_block_tables)
         return self._cached_prefill_metadata
 
     @property
@@ -162,41 +209,88 @@ class ROCmFlashAttentionMetadata(AttentionMetadata, PagedAttentionMetadata):
             context_lens_tensor=None,
             block_tables=self.block_tables[self.num_prefills:],
             use_cuda_graph=self.use_cuda_graph,
-        )
+            # Begin encoder & cross attn fields below...
+            encoder_seq_lens=self.encoder_seq_lens,
+            encoder_seq_lens_tensor=self.encoder_seq_lens_tensor,
+            max_encoder_seq_len=self.max_encoder_seq_len,
+            cross_slot_mapping=self.cross_slot_mapping,
+            cross_block_tables=self.cross_block_tables)
         return self._cached_decode_metadata
 
+    def advance_step(self,
+                     model_input: "ModelInputForGPUWithSamplingMetadata",
+                     sampled_token_ids: Optional[torch.Tensor],
+                     block_size: int,
+                     num_seqs: int,
+                     num_queries: int,
+                     turn_prefills_into_decodes: bool = False):
+        """
+        Update metadata in-place to advance one decode step.
+        """
 
-def _make_alibi_bias(
-    alibi_slopes: torch.Tensor,
-    dtype: torch.dtype,
-    seq_lens: List[int],
-) -> List[torch.Tensor]:
-    attn_biases = []
-    for seq_len in seq_lens:
-        bias = torch.arange(seq_len, dtype=dtype)
-        # NOTE(zhuohan): HF uses
-        #     `bias = bias[None, :].repeat(seq_len, 1)`
-        # here. We find that both biases give the same results, but
-        # the bias below more accurately follows the original ALiBi
-        # paper.
-        bias = bias[None, :] - bias[:, None]
+        assert not turn_prefills_into_decodes, \
+            ("Chunked prefill is not supported with rocm_flash_attn yet."
+             "turn_prefills_into_decodes is a Multi-Step + Chunked-Prefill "
+             "specific parameter.")
 
-        num_heads = alibi_slopes.shape[0]
-        bias = bias[None, :].repeat((num_heads, 1, 1)).to(alibi_slopes.device)
-        bias.mul_(alibi_slopes[:, None, None])
-        inf_mask = torch.empty(
-            (1, seq_len, seq_len),
-            dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1).to(
-                alibi_slopes.device)
-        attn_biases.append((bias + inf_mask).to(dtype))
+        # When using cudagraph, the num_seqs is padded to the next captured
+        # batch sized, but num_queries tracks the actual number of requests in
+        # the batch. For --enforce-eager mode, num_seqs == num_queries
+        if num_seqs != num_queries:
+            assert num_seqs > num_queries
+            assert self.use_cuda_graph
 
-    return attn_biases
+        assert self.num_prefills == 0
+        assert self.num_prefill_tokens == 0
+        assert self.num_decode_tokens == num_seqs
+        assert self.slot_mapping.shape == (num_seqs, )
+
+        assert self.seq_lens is not None
+        assert len(self.seq_lens) == num_seqs
+        assert self.seq_lens_tensor is not None
+        assert self.seq_lens_tensor.shape == (num_seqs, )
+        assert self.max_query_len == 1
+        assert self.max_prefill_seq_len == 0
+        assert self.max_decode_seq_len == max(self.seq_lens)
+
+        assert self.query_start_loc is not None
+        assert self.query_start_loc.shape == (num_queries + 1, )
+        assert self.seq_start_loc is not None
+        assert self.seq_start_loc.shape == (num_seqs + 1, )
+
+        assert self.context_lens_tensor is not None
+        assert self.context_lens_tensor.shape == (num_queries, )
+
+        assert self.block_tables is not None
+        assert self.block_tables.shape[0] == num_seqs
+
+        # Update query lengths. Note that we update only queries and not seqs,
+        # since tensors may be padded due to captured cuda graph batch size
+        for i in range(num_queries):
+            self.seq_lens[i] += 1
+        self.max_decode_seq_len = max(self.seq_lens)
+
+        ops.advance_step_flashattn(num_seqs=num_seqs,
+                                   num_queries=num_queries,
+                                   block_size=block_size,
+                                   input_tokens=model_input.input_tokens,
+                                   sampled_token_ids=sampled_token_ids,
+                                   input_positions=model_input.input_positions,
+                                   seq_lens=self.seq_lens_tensor,
+                                   slot_mapping=self.slot_mapping,
+                                   block_tables=self.block_tables)
 
 
-def _make_alibi_bias_v2(alibi_slopes: torch.Tensor,
-                        dtype: torch.dtype,
-                        seq_lens: Optional[List[int]],
-                        make_attn_mask: bool = True) -> List[torch.Tensor]:
+class ROCmFlashAttentionMetadataBuilder(
+        CommonMetadataBuilder[ROCmFlashAttentionMetadata]):
+
+    _metadata_cls = ROCmFlashAttentionMetadata
+
+
+def _make_alibi_bias(alibi_slopes: torch.Tensor,
+                     dtype: torch.dtype,
+                     seq_lens: Optional[List[int]],
+                     make_attn_mask: bool = True) -> List[torch.Tensor]:
     attn_biases = []
     if seq_lens:
         for seq_len in seq_lens:
@@ -222,6 +316,97 @@ def _make_alibi_bias_v2(alibi_slopes: torch.Tensor,
                 attn_biases.append(bias.to(dtype))
 
     return attn_biases
+
+
+def _get_seq_len_block_table_args(
+    attn_metadata: ROCmFlashAttentionMetadata,
+    attn_type: AttentionType,
+) -> tuple:
+    '''
+    The particular choice of sequence-length
+    attributes which should be extracted from attn_metadata is dependent
+    on the type of attention operation.
+
+    Decoder attn -> select entirely decoder self-attention-related fields
+    Encoder/decoder cross-attn -> select encoder sequence lengths
+    Encoder attn -> select encoder sequence lengths fields
+    
+    Arguments:
+
+    * attn_metadata: Attention metadata structure associated with attention op
+    * attn_type: encoder attention, decoder self-attention,
+                encoder/decoder cross-attention
+
+    Returns:
+
+    * Appropriate sequence-lengths tensors for query and key
+    * Appropriate max sequence-length scalar
+    '''
+
+    partial_prefix_sum = 0
+    if attn_type == AttentionType.ENCODER:
+        assert attn_metadata.encoder_seq_lens is not None
+        assert attn_metadata.encoder_seq_lens_tensor is not None
+        query_seq_start_loc = torch.tensor(
+            [0] + [
+                partial_prefix_sum := partial_prefix_sum + i
+                for i in attn_metadata.encoder_seq_lens
+            ],
+            device=attn_metadata.encoder_seq_lens_tensor.device,
+            dtype=attn_metadata.encoder_seq_lens_tensor.dtype)
+        causal_mask = False
+
+        # No block tables associated with encoder attention
+        return (query_seq_start_loc, attn_metadata.max_encoder_seq_len,
+                query_seq_start_loc, attn_metadata.max_encoder_seq_len,
+                attn_metadata.encoder_seq_lens, causal_mask)
+    elif attn_type == AttentionType.DECODER:
+        # Decoder self-attention
+        # Choose max_seq_len based on whether we are in prompt_run
+        assert attn_metadata.seq_lens is not None
+        assert attn_metadata.seq_lens_tensor is not None
+        query_seq_start_loc = torch.tensor(
+            [0] + [
+                partial_prefix_sum := partial_prefix_sum + i
+                for i in attn_metadata.seq_lens
+            ],
+            device=attn_metadata.seq_lens_tensor.device,
+            dtype=attn_metadata.seq_lens_tensor.dtype)
+        max_seq_len = attn_metadata.max_prefill_seq_len
+        causal_mask = True
+
+        return (query_seq_start_loc, max_seq_len, query_seq_start_loc,
+                max_seq_len, attn_metadata.seq_lens, causal_mask)
+    elif attn_type == AttentionType.ENCODER_DECODER:
+        assert attn_metadata.seq_lens is not None
+        assert attn_metadata.encoder_seq_lens_tensor is not None
+        query_start_loc = torch.tensor(
+            [0] + [
+                partial_prefix_sum := partial_prefix_sum + i
+                for i in attn_metadata.seq_lens
+            ],
+            device=attn_metadata.encoder_seq_lens_tensor.device,
+            dtype=attn_metadata.encoder_seq_lens_tensor.dtype)
+
+        partial_prefix_sum = 0
+        assert attn_metadata.encoder_seq_lens is not None
+        assert attn_metadata.seq_lens_tensor is not None
+        key_seq_start_loc = torch.tensor(
+            [0] + [
+                partial_prefix_sum := partial_prefix_sum + i
+                for i in attn_metadata.encoder_seq_lens
+            ],
+            device=attn_metadata.seq_lens_tensor.device,
+            dtype=attn_metadata.seq_lens_tensor.dtype)
+        causal_mask = False
+
+        # Enc/dec cross-attention KVs match encoder sequence length;
+        # cross-attention utilizes special "cross" block tables
+        return (query_start_loc, attn_metadata.max_prefill_seq_len,
+                key_seq_start_loc, attn_metadata.max_encoder_seq_len,
+                attn_metadata.seq_lens, causal_mask)
+    else:
+        raise AttributeError(f"Invalid attention type {str(attn_type)}")
 
 
 class ROCmFlashAttentionImpl(AttentionImpl):
@@ -260,9 +445,15 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         sliding_window: Optional[int],
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
+        logits_soft_cap: Optional[float] = None,
     ) -> None:
-        assert blocksparse_params is None, ValueError(
-            "ROCFlashAttention does not support blocksparse attention.")
+        if blocksparse_params is not None:
+            raise ValueError(
+                "ROCmFlashAttention does not support blocksparse attention.")
+        if logits_soft_cap is not None:
+            raise ValueError(
+                "ROCmFlashAttention does not support attention logits soft "
+                "capping.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -291,10 +482,16 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 triton_attention)
             self.attn_func = triton_attention
             logger.debug("Using Triton FA in ROCmBackend")
+            if self.sliding_window != (-1, -1):
+                logger.warning("ROCm Triton FA does not currently support "
+                               "sliding window attention. If using half "
+                               "precision, please try using the ROCm CK "
+                               "FA backend instead by setting the env var "
+                               "`VLLM_USE_TRITON_FLASH_ATTN=0`")
         else:
             # if not using triton, navi3x/navi21/navi10 do not use flash-attn
             # either
-            if torch.cuda.get_device_capability()[0] != 9:
+            if not current_platform.has_device_capability(90):
                 self.use_naive_attn = True
             else:
                 try:
@@ -305,7 +502,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.use_naive_attn = True
 
             if self.use_naive_attn:
-                self.attn_func = _naive_attention
+                self.attn_func = _sdpa_attention
                 logger.debug("Using naive (SDPA) attention in ROCmBackend")
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -323,122 +520,194 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: ROCmFlashAttentionMetadata,
-        kv_scale: float = 1.0,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        attn_type: AttentionType = AttentionType.DECODER,
+        fp8_out_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
+
+        For decoder-only models: query, key and value must be non-None.
+
+        For encoder/decoder models:
+        * ROCmFlashAttentionImpl.forward() may be invoked for both self- and 
+            cross-attention layers.
+        * For self-attention: query, key and value must be non-None.
+        * For cross-attention:
+            * Query must be non-None
+            * During prefill, key and value must be non-None; key and value
+              get cached for use during decode.
+            * During decode, key and value may be None, since:
+              (1) key and value tensors were cached during prefill, and
+              (2) cross-attention key and value tensors do not grow during
+                  decode
+        
+        A note on how the attn_type (attention type enum) argument impacts
+        attention forward() behavior:
+    
+            * DECODER: normal decoder-only behavior;
+                use decoder self-attention block table
+            * ENCODER: no KV caching; pass encoder sequence
+                attributes (encoder_seq_lens/encoder_seq_lens_tensor/
+                max_encoder_seq_len) to kernel, in lieu of decoder
+                sequence attributes (seq_lens/seq_lens_tensor/max_seq_len)
+            * ENCODER_DECODER: cross-attention behavior;
+                use cross-attention block table for caching KVs derived
+                from encoder hidden states; since KV sequence lengths
+                will match encoder sequence lengths, pass encoder sequence
+                attributes to kernel (encoder_seq_lens/encoder_seq_lens_tensor/
+                max_encoder_seq_len)
 
         Args:
             query: shape = [num_tokens, num_heads * head_size]
             key: shape = [num_tokens, num_kv_heads * head_size]
             value: shape = [num_tokens, num_kv_heads * head_size]
             kv_cache = [2, num_blocks, block_size * num_kv_heads * head_size]
+                NOTE: kv_cache will be an empty tensor with shape [0]
+                for profiling run.
             attn_metadata: Metadata for attention.
+            attn_type: Select attention type, between encoder attention,
+                       decoder self-attention, or encoder/decoder cross-
+                       attention. Defaults to decoder self-attention,
+                       which is the vLLM default generally
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        num_tokens, hidden_size = query.shape
-        # Reshape the query, key, and value tensors.
-        query = query.view(-1, self.num_heads, self.head_size)
-        key = key.view(-1, self.num_kv_heads, self.head_size)
-        value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        if kv_cache is not None:
+        query = query.view(-1, self.num_heads, self.head_size)
+        if key is not None:
+            assert value is not None
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+            value = value.view(-1, self.num_kv_heads, self.head_size)
+        else:
+            assert value is None
+
+        if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
 
-            # Reshape the input keys and values and store them in the cache.
-            # If kv_cache is not provided, the new key and value tensors are
-            # not cached. This happens during the initial memory profiling run.
-            PagedAttention.write_to_paged_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                kv_scale,
-            )
+            if key is not None and value is not None:
+                # Reshape the input keys and values and store them in the
+                # cache. If kv_cache is not provided, the new key and value
+                # tensors are not cached. This happens during the initial
+                # memory profiling run.
+                PagedAttention.write_to_paged_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    attn_metadata.cross_slot_mapping,
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
 
-        num_prefill_tokens = attn_metadata.num_prefill_tokens
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-        assert value.shape[0] == num_prefill_tokens + num_decode_tokens
+        if attn_type != AttentionType.ENCODER:
+            num_prefill_tokens = attn_metadata.num_prefill_tokens
+        else:
+            assert attn_metadata.num_encoder_tokens is not None
+            num_prefill_tokens = attn_metadata.num_encoder_tokens
 
-        output = torch.empty_like(query)
         # Query for decode. KV is not needed because it is already cached.
         decode_query = query[num_prefill_tokens:]
+
         # QKV for prefill.
         query = query[:num_prefill_tokens]
-        key = key[:num_prefill_tokens]
-        value = value[:num_prefill_tokens]
-
-        assert query.shape[0] == num_prefill_tokens
-        assert decode_query.shape[0] == num_decode_tokens
+        if key is not None and value is not None:
+            key = key[:num_prefill_tokens]
+            value = value[:num_prefill_tokens]
 
         if prefill_meta := attn_metadata.prefill_metadata:
+            output = torch.empty_like(query)
+            (query_seq_start_loc, query_max_seq_len, key_seq_start_loc,
+             key_max_seq_len, seq_lens,
+             causal_mask) = _get_seq_len_block_table_args(
+                 prefill_meta, attn_type)
+
             # Prompt run.
-            assert prefill_meta.seq_lens is not None
-            if kv_cache is None or prefill_meta.block_tables.numel() == 0:
+            if kv_cache.numel() == 0 or prefill_meta.block_tables.numel() == 0:
                 # triton attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
-                att_masks = None
+                attn_masks = None
                 if self.use_triton_flash_attn:
                     if self.alibi_slopes is not None:
-                        att_masks = _make_alibi_bias_v2(
+                        attn_masks = _make_alibi_bias(
                             self.alibi_slopes,
                             query.dtype,
-                            attn_metadata.seq_lens,
+                            seq_lens,
                             make_attn_mask=False)  # type: ignore
                     out, _ = self.attn_func(
                         query,
                         key,
                         value,
                         None,
-                        prefill_meta.seq_start_loc,
-                        prefill_meta.seq_start_loc,
-                        prefill_meta.max_prefill_seq_len,
-                        prefill_meta.max_prefill_seq_len,
-                        True,
+                        query_seq_start_loc,
+                        key_seq_start_loc,
+                        query_max_seq_len,
+                        key_max_seq_len,
+                        causal_mask,
                         self.scale,
-                        att_masks[0][None] if att_masks is not None else None,
+                        attn_masks[0][None]
+                        if attn_masks is not None else None,
                     )
                 elif self.use_naive_attn:
-                    if self.alibi_slopes is not None:
-                        att_masks = _make_alibi_bias_v2(
-                            self.alibi_slopes,
-                            query.dtype,
-                            attn_metadata.seq_lens,
-                            make_attn_mask=True)  # type: ignore
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.
                         key = self.repeat_kv(key, self.num_queries_per_kv)
                         value = self.repeat_kv(value, self.num_queries_per_kv)
-                    out = self.attn_func(query, key, value,
-                                         prefill_meta.seq_lens, self.scale,
-                                         att_masks)
+                    if self.alibi_slopes is not None:
+                        attn_masks = _make_alibi_bias(
+                            self.alibi_slopes,
+                            query.dtype,
+                            attn_metadata.seq_lens,
+                            make_attn_mask=True)  # type: ignore
+                    query = query.movedim(0, query.dim() - 2)
+                    key = key.movedim(0, key.dim() - 2)
+                    value = value.movedim(0, value.dim() - 2)
+                    # sdpa math backend attention
+                    out = self.attn_func(
+                        query,
+                        key,
+                        value,
+                        query_seq_start_loc,
+                        num_prefill_tokens,
+                        self.num_heads,
+                        self.head_size,
+                        self.scale,
+                        causal_mask,
+                        attn_masks,
+                    )
                 else:
                     out = self.attn_func(
                         q=query,
                         k=key,
                         v=value,
-                        cu_seqlens_q=prefill_meta.seq_start_loc,
-                        cu_seqlens_k=prefill_meta.seq_start_loc,
+                        cu_seqlens_q=query_seq_start_loc,
+                        cu_seqlens_k=key_seq_start_loc,
                         max_seqlen_q=prefill_meta.max_prefill_seq_len,
-                        max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                        max_seqlen_k=key_max_seq_len,
                         softmax_scale=self.scale,
                         causal=True,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
                     )
 
                 # common code for prefill
                 assert output[:num_prefill_tokens].shape == out.shape
-                output[:num_prefill_tokens] = out
+                if output.shape[0] > num_prefill_tokens:
+                    output[:num_prefill_tokens] = out
+                else:
+                    output = out
             else:
                 # prefix-enabled attention
                 output[:num_prefill_tokens] = PagedAttention.forward_prefix(
                     query,
                     key,
                     value,
+                    self.kv_cache_dtype,
                     key_cache,
                     value_cache,
                     prefill_meta.block_tables,
@@ -448,71 +717,144 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     prefill_meta.max_query_len,
                     self.alibi_slopes,
                     self.sliding_window[0],
+                    k_scale,
+                    v_scale,
                 )
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
-            output[num_prefill_tokens:] = PagedAttention.forward_decode(
-                decode_query,
-                key_cache,
-                value_cache,
-                decode_meta.block_tables,
-                decode_meta.seq_lens_tensor,
-                decode_meta.max_decode_seq_len,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                kv_scale,
-            )
+            # Whether to use rocm custom paged attention or not
+            output = torch.empty_like(decode_query)
+            num_seqs, num_heads, head_size = decode_query.shape
+            block_size = value_cache.shape[3]
+            gqa_ratio = num_heads // self.num_kv_heads
+            use_custom = _use_rocm_custom_paged_attention(
+                decode_query.dtype, head_size, block_size, gqa_ratio,
+                decode_meta.max_decode_seq_len)
+            if use_custom:
+                max_seq_len = (decode_meta.max_decode_seq_len
+                               if attn_type != AttentionType.ENCODER_DECODER
+                               else decode_meta.max_encoder_seq_len)
+                assert max_seq_len is not None
+                max_num_partitions = (
+                    (max_seq_len + _PARTITION_SIZE_ROCM - 1) //
+                    _PARTITION_SIZE_ROCM)
+                assert _PARTITION_SIZE_ROCM % block_size == 0
+                tmp_output = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions, head_size),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                exp_sums = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+                max_logits = torch.empty_like(exp_sums)
+                cpa_fp8_out = False
+                if num_prefill_tokens > 0:
+                    out = output[num_prefill_tokens:]
+                else:
+                    if fp8_out_scale is not None:
+                        out = torch.empty_like(output,
+                                               dtype=torch.float8_e4m3fnuz)
+                        cpa_fp8_out = True
+                    else:
+                        out = output
+                ops.paged_attention_rocm(
+                    out,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    decode_query,
+                    key_cache,
+                    value_cache,
+                    self.num_kv_heads,
+                    self.scale,
+                    decode_meta.block_tables
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    decode_meta.cross_block_tables,
+                    decode_meta.seq_lens_tensor
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    decode_meta.encoder_seq_lens_tensor,
+                    block_size,
+                    max_seq_len,
+                    self.alibi_slopes,
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                    fp8_out_scale if cpa_fp8_out else None,
+                )
+                if cpa_fp8_out:
+                    return out.view(num_seqs, num_heads * head_size)
+            else:
+                output[num_prefill_tokens:] = PagedAttention.forward_decode(
+                    decode_query,
+                    key_cache,
+                    value_cache,
+                    decode_meta.block_tables
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    decode_meta.cross_block_tables,
+                    decode_meta.seq_lens_tensor
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    decode_meta.encoder_seq_lens_tensor,
+                    decode_meta.max_decode_seq_len
+                    if attn_type != AttentionType.ENCODER_DECODER else
+                    decode_meta.max_encoder_seq_len,
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    k_scale,
+                    v_scale,
+                )
 
         # Reshape the output tensor.
-        return output.view(num_tokens, hidden_size)
+        return output.view(-1, self.num_heads * self.head_size)
 
 
-def _naive_attention(
+def _sdpa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     seq_lens: List[int],
+    num_tokens: int,
+    num_heads: int,
+    head_size: int,
     scale: float,
-    attn_masks: Optional[List[torch.Tensor]],
+    is_causal: bool,
+    attn_masks: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
-    output = torch.empty_like(query)
     start = 0
+    output = torch.empty((num_tokens, num_heads, head_size),
+                         dtype=query.dtype,
+                         device=query.device)
+
     for i, seq_len in enumerate(seq_lens):
         end = start + seq_len
-        out = _naive_masked_attention(
-            query[start:end],
-            key[start:end],
-            value[start:end],
-            scale,
-            attn_masks[i] if attn_masks else None,
-        )
-        # TODO(woosuk): Unnecessary copy. Optimize.
-        output[start:end].copy_(out)
-        start += seq_len
+        with torch.backends.cuda.sdp_kernel(enable_math=True,
+                                            enable_flash=False,
+                                            enable_mem_efficient=False):
+            sub_out = torch.nn.functional.scaled_dot_product_attention(
+                query[:, start:end, :],
+                key[:, start:end, :],
+                value[:, start:end, :],
+                dropout_p=0.0,
+                is_causal=is_causal,
+                attn_mask=attn_masks[i] if attn_masks else None,
+                scale=scale).movedim(query.dim() - 2, 0)
+            output[start:end, :, :] = sub_out
+            start = end
 
     return output
 
 
-def _naive_masked_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scale: float,
-    attn_mask: Optional[torch.Tensor],
-) -> torch.Tensor:
-    seq_len, head_size, head_dim = query.shape
-    if attn_mask is None:
-        attn_mask = torch.triu(torch.ones(seq_len,
-                                          seq_len,
-                                          dtype=query.dtype,
-                                          device=query.device),
-                               diagonal=1)
-        attn_mask = attn_mask * torch.finfo(query.dtype).min
-    attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
-    attn_weights = attn_weights + attn_mask.float()
-    attn_weights = torch.softmax(attn_weights, dim=-1).to(value.dtype)
-    out = torch.einsum("hqk,khd->qhd", attn_weights, value)
-    return out
+def _use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
+                                     block_size: int, gqa_ratio: int,
+                                     max_seq_len: int) -> bool:
+    # rocm custom page attention not support on navi (gfx1*)
+    return (not _ON_NAVI and (qtype == torch.half or qtype == torch.bfloat16)
+            and (head_size == 64 or head_size == 128)
+            and (block_size == 16 or block_size == 32)
+            and (gqa_ratio >= 1 and gqa_ratio <= 16)
+            and max_seq_len <= 128 * 1024)

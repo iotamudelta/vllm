@@ -4,18 +4,14 @@ from typing import List, Optional, Tuple
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.attention.ops.prefix_prefill import context_attention_fwd
-from vllm.envs import VLLM_USE_ROCM_CUSTOM_PAGED_ATTN
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils import is_hip
 
-custom_attn_available = is_hip() and VLLM_USE_ROCM_CUSTOM_PAGED_ATTN and \
-    "gfx1" not in torch.cuda.get_device_properties('cuda').gcnArchName
-if custom_attn_available:
-    from vllm._custom_C import paged_attention_custom
+if HAS_TRITON:
+    from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
-_PARTITION_SIZE_V1V2 = 512
-_PARTITION_SIZE_CUSTOM = 256
+_PARTITION_SIZE = 512 if not is_hip() else 1024
 
 
 @dataclass
@@ -39,7 +35,7 @@ class PagedAttention:
 
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
-        return [64, 80, 96, 112, 128, 192, 256]
+        return [64, 80, 96, 112, 120, 128, 192, 256]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -74,7 +70,8 @@ class PagedAttention:
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
-        kv_scale: float,
+        k_scale: float,
+        v_scale: float,
     ) -> None:
         ops.reshape_and_cache(
             key,
@@ -83,7 +80,8 @@ class PagedAttention:
             value_cache,
             slot_mapping.flatten(),
             kv_cache_dtype,
-            kv_scale,
+            k_scale,
+            v_scale,
         )
 
     @staticmethod
@@ -98,7 +96,8 @@ class PagedAttention:
         num_kv_heads: int,
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
-        kv_scale: float,
+        k_scale: float,
+        v_scale: float,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -116,19 +115,6 @@ class PagedAttention:
         output = torch.empty_like(query)
         block_size = value_cache.shape[3]
         num_seqs, num_heads, head_size = query.shape
-        gqa_ratio = num_heads // num_kv_heads
-        use_custom = (custom_attn_available
-                      and (query.dtype == torch.half
-                           or query.dtype == torch.bfloat16)
-                      and (head_size == 128 or head_size == 64)
-                      and (block_size == 16 or block_size == 32)
-                      and kv_cache_dtype == "auto"
-                      and (gqa_ratio >= 1 and gqa_ratio <= 16)
-                      and max_seq_len <= 32768)
-        if not use_custom:
-            _PARTITION_SIZE = _PARTITION_SIZE_V1V2
-        else:
-            _PARTITION_SIZE = _PARTITION_SIZE_CUSTOM
         max_num_partitions = ((max_seq_len + _PARTITION_SIZE - 1) //
                               _PARTITION_SIZE)
         # NOTE(woosuk): We use a simple heuristic to decide whether to use
@@ -139,8 +125,8 @@ class PagedAttention:
         # TODO(woosuk): Tune this heuristic.
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = (max_seq_len <= 8192
-                  and (max_num_partitions == 1 or num_seqs * num_heads > 512)
-                  and not use_custom)
+                  and (max_num_partitions == 1 or num_seqs * num_heads > 512))
+
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
@@ -156,7 +142,8 @@ class PagedAttention:
                 max_seq_len,
                 alibi_slopes,
                 kv_cache_dtype,
-                kv_scale,
+                k_scale,
+                v_scale,
                 tp_rank,
                 blocksparse_local_blocks,
                 blocksparse_vert_stride,
@@ -164,7 +151,7 @@ class PagedAttention:
                 blocksparse_head_sliding_step,
             )
         else:
-            # Run PagedAttention V2 or PagedAttention Custom.
+            # Run PagedAttention V2.
             assert _PARTITION_SIZE % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
@@ -177,48 +164,30 @@ class PagedAttention:
                 device=output.device,
             )
             max_logits = torch.empty_like(exp_sums)
-            if not use_custom:
-                ops.paged_attention_v2(
-                    output,
-                    exp_sums,
-                    max_logits,
-                    tmp_output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                    kv_scale,
-                    tp_rank,
-                    blocksparse_local_blocks,
-                    blocksparse_vert_stride,
-                    blocksparse_block_size,
-                    blocksparse_head_sliding_step,
-                )
-            else:
-                paged_attention_custom(
-                    output,
-                    exp_sums,
-                    max_logits,
-                    tmp_output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                )
+            ops.paged_attention_v2(
+                output,
+                exp_sums,
+                max_logits,
+                tmp_output,
+                query,
+                key_cache,
+                value_cache,
+                num_kv_heads,
+                scale,
+                block_tables,
+                seq_lens,
+                block_size,
+                max_seq_len,
+                alibi_slopes,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                tp_rank,
+                blocksparse_local_blocks,
+                blocksparse_vert_stride,
+                blocksparse_block_size,
+                blocksparse_head_sliding_step,
+            )
         return output
 
     @staticmethod
@@ -226,6 +195,7 @@ class PagedAttention:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        kv_cache_dtype: str,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         block_tables: torch.Tensor,
@@ -235,6 +205,8 @@ class PagedAttention:
         max_query_len: int,
         alibi_slopes: Optional[torch.Tensor],
         sliding_window: Optional[int],
+        k_scale: float,
+        v_scale: float,
     ) -> torch.Tensor:
         output = torch.empty_like(query)
         context_attention_fwd(
@@ -242,6 +214,7 @@ class PagedAttention:
             key,
             value,
             output,
+            kv_cache_dtype,
             key_cache,
             value_cache,
             block_tables,
@@ -250,6 +223,8 @@ class PagedAttention:
             seq_lens_tensor,
             context_lens,
             max_query_len,
+            k_scale,
+            v_scale,
             alibi_slopes,
             sliding_window,
         )

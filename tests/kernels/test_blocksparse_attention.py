@@ -7,7 +7,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.attention.ops.blocksparse_attention.interface import (
     LocalStridedBlockSparseAttn)
-from vllm.utils import get_max_shared_memory_bytes, is_hip
+from vllm.utils import get_max_shared_memory_bytes, is_hip, seed_everything
 
 from .allclose_default import get_default_atol, get_default_rtol
 
@@ -20,7 +20,7 @@ MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
 # There may not be enough gpu memory due to large NUM_BLOCKS.
 # Reduce NUM_BLOCKS when it happens.
 NUM_BLOCKS = 4321  # Arbitrary values for testing
-PARTITION_SIZE = 512
+PARTITION_SIZE = 512 if not is_hip() else 1024
 DTYPES = [torch.half, torch.bfloat16]
 NUM_GEN_SEQS = [3]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
@@ -77,27 +77,27 @@ def ref_single_query_cached_kv_attention(
     block_size = value_cache.shape[3]
     num_seqs = query.shape[0]
 
-    block_tables = block_tables.cpu().tolist()
-    seq_lens = seq_lens.cpu().tolist()
+    block_tables_lst = block_tables.cpu().tolist()
+    seq_lens_lst = seq_lens.cpu().tolist()
     for i in range(num_seqs):
         q = query[i].unsqueeze(0)
-        block_table = block_tables[i]
-        seq_len = int(seq_lens[i])
+        block_table = block_tables_lst[i]
+        seq_len = int(seq_lens_lst[i])
 
-        keys = []
-        values = []
+        keys_lst: List[torch.Tensor] = []
+        values_lst: List[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
 
             k = key_cache[block_number, :, :, block_offset, :]
             k = k.reshape(num_kv_heads, head_size)
-            keys.append(k)
+            keys_lst.append(k)
 
             v = value_cache[block_number, :, :, block_offset]
-            values.append(v)
-        keys = torch.stack(keys, dim=0)
-        values = torch.stack(values, dim=0)
+            values_lst.append(v)
+        keys = torch.stack(keys_lst, dim=0)
+        values = torch.stack(values_lst, dim=0)
         if num_queries_per_kv > 1:
             # Handle MQA and GQA
             keys = torch.repeat_interleave(keys, num_queries_per_kv, dim=1)
@@ -172,10 +172,7 @@ def test_paged_attention(
     blocksparse_block_size: int,
     blocksparse_head_sliding_step: int,
 ) -> None:
-    random.seed(seed)
-    torch.random.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+    seed_everything(seed)
     torch.set_default_device(device)
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
@@ -212,7 +209,7 @@ def test_paged_attention(
     key_cache, value_cache = key_caches[0], value_caches[0]
 
     # Using default kv_scale
-    kv_scale = 1.0
+    k_scale = v_scale = 1.0
     tp_rank = 0
 
     # Call the paged attention kernel.
@@ -231,7 +228,8 @@ def test_paged_attention(
             max_seq_len,
             alibi_slopes,
             kv_cache_dtype,
-            kv_scale,
+            k_scale,
+            v_scale,
             tp_rank=tp_rank,
             blocksparse_local_blocks=blocksparse_local_blocks,
             blocksparse_vert_stride=blocksparse_vert_stride,
@@ -267,7 +265,8 @@ def test_paged_attention(
             max_seq_len,
             alibi_slopes,
             kv_cache_dtype,
-            kv_scale,
+            k_scale,
+            v_scale,
             tp_rank=tp_rank,
             blocksparse_local_blocks=blocksparse_local_blocks,
             blocksparse_vert_stride=blocksparse_vert_stride,
@@ -325,7 +324,7 @@ def test_paged_attention(
     atol, rtol = 1e-3, 1e-5
     if kv_cache_dtype == "fp8":
         atol, rtol = 1e-2, 1e-5
-    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
 
 def ref_multi_query_kv_attention(
@@ -384,10 +383,7 @@ def test_varlen_blocksparse_attention_prefill(
     seed: int,
     device: str,
 ) -> None:
-    random.seed(seed)
-    torch.random.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+    seed_everything(seed)
     torch.set_default_device(device)
     # MAX_SEQ_LEN sometimes causes OOM in the reference implementation.
     # As the xformers library is already tested with its own tests, we can use
@@ -432,11 +428,11 @@ def test_varlen_blocksparse_attention_prefill(
         value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
 
     ref_output = ref_multi_query_kv_attention(
-        cu_seq_lens,
+        cu_seq_lens.tolist(),
         query,
         key,
         value,
         scale,
         dtype,
     )
-    assert torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
