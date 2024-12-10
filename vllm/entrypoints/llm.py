@@ -136,7 +136,7 @@ class LLM:
         enforce_eager: Optional[bool] = None,
         max_context_len_to_capture: Optional[int] = None,
         max_seq_len_to_capture: int = 8192,
-        disable_custom_all_reduce: bool = False,
+        disable_custom_all_reduce: bool = True,
         disable_async_output_proc: bool = False,
         mm_processor_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
@@ -897,6 +897,7 @@ class LLM:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+        print(sorted(outputs, key=lambda x: int(x.request_id)))
         return sorted(outputs, key=lambda x: int(x.request_id))
 
     def _is_encoder_decoder_model(self):

@@ -14,7 +14,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-#from vllm.model_executor.layers.tuned_gemm import tgemm
+from vllm.model_executor.layers.tuned_gemm import tgemm
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
@@ -91,10 +91,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         weight = layer.weight
-#        if self.separate_bias_add and bias is not None:
-#            return tgemm.mm(x, weight) + bias
-#        return tgemm.mm(x, weight, bias)
-        return F.linear(x, weight, bias)
+        if self.separate_bias_add and bias is not None:
+            return tgemm.mm(x, weight) + bias
+        return tgemm.mm(x, weight, bias)
+        #return F.linear(x, weight, bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -116,6 +116,7 @@ class LinearBase(torch.nn.Module):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -154,9 +155,10 @@ class ReplicatedLinear(LinearBase):
                  bias: bool = True,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
-                         quant_config)
+                         quant_config, prefix)
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
@@ -215,9 +217,10 @@ class ColumnParallelLinear(LinearBase):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 output_sizes: Optional[List[int]] = None):
+                 output_sizes: Optional[List[int]] = None,
+                 prefix: str = ""):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
-                         quant_config)
+                         quant_config, prefix)
 
         self.gather_output = gather_output
 
@@ -327,7 +330,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                  gather_output: bool = False,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
@@ -337,7 +341,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          gather_output=gather_output,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         prefix=prefix)
 
     def weight_loader(self,
                       param: Parameter,
@@ -491,7 +496,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                  bias: bool = True,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -523,7 +529,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                          gather_output=False,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         prefix=prefix)
 
     def weight_loader(self,
                       param: Parameter,
@@ -714,7 +721,8 @@ class QKVParallelLinearModified(ColumnParallelLinear):
                  bias: bool = True,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -754,7 +762,8 @@ class QKVParallelLinearModified(ColumnParallelLinear):
                          gather_output=False,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         prefix=prefix)
 
     def weight_loader(self,
                       param: Parameter,
@@ -1021,9 +1030,10 @@ class RowParallelLinear(LinearBase):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  reduce_results: bool = True,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
-                         quant_config)
+                         quant_config, prefix)
 
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results

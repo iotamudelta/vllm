@@ -124,7 +124,7 @@ class EngineArgs:
     enforce_eager: Optional[bool] = None
     max_context_len_to_capture: Optional[int] = None
     max_seq_len_to_capture: int = 8192
-    disable_custom_all_reduce: bool = False
+    disable_custom_all_reduce: bool = True
     tokenizer_pool_size: int = 0
     # Note: Specifying a tokenizer pool by passing a class
     # is intended for expert use only. The API may change without

@@ -821,7 +821,7 @@ class ParallelConfig:
         tensor_parallel_size: int,
         worker_use_ray: Optional[bool] = None,
         max_parallel_loading_workers: Optional[int] = None,
-        disable_custom_all_reduce: bool = False,
+        disable_custom_all_reduce: bool = True,
         tokenizer_pool_config: Optional[TokenizerPoolConfig] = None,
         ray_workers_use_nsight: bool = False,
         placement_group: Optional["PlacementGroup"] = None,
