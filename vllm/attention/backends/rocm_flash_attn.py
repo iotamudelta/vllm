@@ -15,6 +15,12 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce)
+
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
@@ -454,10 +460,13 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             raise ValueError(
                 "ROCmFlashAttention does not support attention logits soft "
                 "capping.")
+        tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = num_heads
+        self.total_num_heads = num_heads * tp_size
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        self.total_num_kv_heads = num_kv_heads * tp_size
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -515,13 +524,15 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query_sub: torch.Tensor,
+        key_sub: torch.Tensor,
+        value_sub: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: ROCmFlashAttentionMetadata,
+        positions,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        tensor_offset: int = 0,
         attn_type: AttentionType = AttentionType.DECODER,
         fp8_out_scale: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -573,20 +584,72 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+# ******** CHANGES MADE ***********#
+        num_tokens, hidden_size = query_sub.shape
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        
+        positions_as_list = positions.tolist()
+        min_num_tokens_per_GPU = key_sub.size(0) // tp_size
+        num_GPUs_with_extra_token = key_sub.size(0) % tp_size        
+        partition_sizes = [0] * tp_size
+        index = positions_as_list[0]%tp_size
+        for each_slice in range(tp_size):
+            append_value = 0
+            if (num_GPUs_with_extra_token > 0):
+                append_value = 1
+                num_GPUs_with_extra_token = num_GPUs_with_extra_token - 1
+            append_value = append_value + min_num_tokens_per_GPU
+            partition_sizes[index%tp_size] = append_value
+            index = index + 1
 
-        query = query.view(-1, self.num_heads, self.head_size)
+        tensor_offset = sum(partition_sizes[:tp_rank]) 
+
+        query_t = tensor_model_parallel_all_gather(query_sub.contiguous())
+        new_key =  torch.cat([key_sub], dim=-1)
+        new_value =  torch.cat([value_sub], dim=-1)
+        kg = tensor_model_parallel_all_gather(new_key.contiguous())
+        vg = tensor_model_parallel_all_gather(new_value.contiguous())
+        splitted_k = kg.split(partition_sizes, dim=0)
+        splitted_v = vg.split(partition_sizes, dim=0)
+
+
+        for trk in range(len(partition_sizes)):
+            k_t = torch.cat([splitted_k[trk]], dim=-1)
+            v_t = torch.cat([splitted_v[trk]], dim=-1)
+            if (tp_rank == trk):
+                key_t = torch.cat([k_t], dim=-1)
+                value_t = torch.cat([v_t], dim=-1)
+
+
+        # Reshape the query, key, and value tensors.
+        if prefill_meta := attn_metadata.prefill_metadata:
+            qt = torch.cat([query_sub], dim=-1)
+            kt = torch.cat([key_sub], dim=-1)
+            vt = torch.cat([value_sub], dim=-1)
+            query = qt.view(-1, self.num_heads , self.head_size)
+            key_prefill = kt.view(-1, self.num_kv_heads , self.head_size)
+            value_prefill = vt.view(-1, self.num_kv_heads , self.head_size)
+        if decode_meta := attn_metadata.decode_metadata:
+            query = query_t.view(-1, self.total_num_heads , self.head_size)
+
+        #query = query.view(-1, self.num_heads, self.head_size)
         if key is not None:
             assert value is not None
-            key = key.view(-1, self.num_kv_heads, self.head_size)
-            value = value.view(-1, self.num_kv_heads, self.head_size)
+            key = key_t.view(-1, self.total_num_kv_heads , self.head_size)
+            value = value_t.view(-1, self.total_num_kv_heads , self.head_size)
+         #   key = key.view(-1, self.num_kv_heads, self.head_size)
+         #   value = value.view(-1, self.num_kv_heads, self.head_size)
         else:
             assert value is None
 
         if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size)
+                kv_cache, self.total_num_kv_heads , self.head_size)
 
-            if key is not None and value is not None:
+            #if key is not None and value is not None:
+            if (key.numel != 0):
+# ******** CHANGES MADE ***********#
                 # Reshape the input keys and values and store them in the
                 # cache. If kv_cache is not provided, the new key and value
                 # tensors are not cached. This happens during the initial
@@ -619,6 +682,19 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             key = key[:num_prefill_tokens]
             value = value[:num_prefill_tokens]
 
+# ******** CHANGES MADE ***********#
+        if prefill_meta := attn_metadata.prefill_metadata:
+            num_seqs = num_prefill_tokens
+            key_prefill = key_prefill[:num_prefill_tokens]
+            value_prefill = value_prefill[:num_prefill_tokens]
+        if decode_meta := attn_metadata.decode_metadata:
+            num_seqs = num_decode_tokens
+
+
+        XCD_exp_sums = torch.zeros(size=(num_seqs, self.total_num_heads ), dtype=torch.float32, device=output.device,)
+        XCD_max_logits = torch.empty_like(XCD_exp_sums)
+# ******** CHANGES MADE ***********#
+
         if prefill_meta := attn_metadata.prefill_metadata:
             output = torch.empty_like(query)
             (query_seq_start_loc, query_max_seq_len, key_seq_start_loc,
@@ -641,8 +717,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             make_attn_mask=False)  # type: ignore
                     out, _ = self.attn_func(
                         query,
-                        key,
-                        value,
+                        key_prefill,
+                        value_prefill,
                         None,
                         query_seq_start_loc,
                         key_seq_start_loc,
@@ -724,6 +800,12 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             # Whether to use rocm custom paged attention or not
+            modified_max_decode_seq_len = decode_meta.max_decode_seq_len // tp_size
+            decode_seq_len_offset = decode_meta.max_decode_seq_len % tp_size
+            if (tp_rank < decode_seq_len_offset):
+                modified_max_decode_seq_len = modified_max_decode_seq_len + 1
+            modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
+
             output = torch.empty_like(decode_query)
             num_seqs, num_heads, head_size = decode_query.shape
             block_size = value_cache.shape[3]
@@ -795,19 +877,50 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.block_tables
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.cross_block_tables,
-                    decode_meta.seq_lens_tensor
+# ******** CHANGES MADE ***********#
+                    modified_seq_lens_tensor
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.encoder_seq_lens_tensor,
-                    decode_meta.max_decode_seq_len
+                    XCD_exp_sums,
+                    XCD_max_logits,
+                    modified_max_decode_seq_len
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.max_encoder_seq_len,
+# ******** CHANGES MADE ***********#
                     self.kv_cache_dtype,
-                    self.num_kv_heads,
+                    self.total_num_kv_heads,
                     self.scale,
                     self.alibi_slopes,
                     k_scale,
                     v_scale,
                 )
+# ******** CHANGES MADE ***********#
+
+            # Inter-XCD Softmax aggregation code
+            #   code to calculate inter-xcd m_i indicated by max_logits_final
+            inter_xcd_max_logit = tensor_model_parallel_all_gather(XCD_max_logits.contiguous())
+            per_xcd_max_logit = torch.split(inter_xcd_max_logit, self.total_num_heads , dim=1)
+            inter_xcd_max_logit_reordered = torch.stack(per_xcd_max_logit, dim=1)
+            max_logits_final, _ = torch.max(inter_xcd_max_logit_reordered, dim=1)
+
+            #   code to calculate inter-xcd l_i indicated by exp_sums_final and aggregated output indicated by output_aggregated
+            delta_logits = XCD_max_logits - max_logits_final
+            alpha = torch.exp(delta_logits)
+            per_xcd_exp_sums = torch.mul(alpha, XCD_exp_sums)
+            per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
+            per_xcd_output = output * per_xcd_exp_sums_expanded
+
+            exp_sums_final = tensor_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
+            output_aggregated = tensor_model_parallel_all_reduce(per_xcd_output.contiguous())
+
+            # code to calculate the final output
+            exp_sums_final_expanded = exp_sums_final.unsqueeze(-1)
+            final_output = output_aggregated / exp_sums_final_expanded
+
+            splitted_final_output = final_output.chunk(tp_size, dim=1)
+            output = splitted_final_output[tp_rank].to(query.dtype)
+#           print(num_tokens, hidden_size, output.shape)
+# ******** CHANGES MADE ***********#
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

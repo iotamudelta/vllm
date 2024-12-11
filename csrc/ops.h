@@ -7,7 +7,7 @@
 
 void paged_attention_v1(
     torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, int64_t num_kv_heads, double scale,
+    torch::Tensor& value_cache, torch::Tensor& xcd_exp_sums, torch::Tensor& xcd_max_logits, int64_t num_kv_heads, double scale,
     torch::Tensor& block_tables, torch::Tensor& seq_lens, int64_t block_size,
     int64_t max_seq_len, const c10::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, double k_scale, double v_scale,

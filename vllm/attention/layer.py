@@ -92,6 +92,8 @@ class Attention(nn.Module):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        positions,
+        tensor_offset: int = 0,
         attn_type: AttentionType = AttentionType.DECODER,
         fp8_out_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -100,8 +102,10 @@ class Attention(nn.Module):
                                  value,
                                  kv_cache,
                                  attn_metadata,
+                                 positions,
                                  self._k_scale,
                                  self._v_scale,
+                                 tensor_offset,
                                  attn_type=attn_type,
                                  fp8_out_scale=fp8_out_scale)
 

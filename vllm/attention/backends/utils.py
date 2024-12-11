@@ -8,6 +8,11 @@ import torch
 from vllm.attention import (AttentionMetadata, AttentionMetadataBuilder,
                             AttentionState)
 from vllm.utils import async_tensor_h2d, is_hip, make_tensor_with_pad
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce)
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner_base import ModelRunnerBase
@@ -57,9 +62,22 @@ def compute_slot_mapping_start_idx(is_prompt: bool, query_len: int,
 def _compute_slot_mapping_python(slot_mapping: List[int],
                                  block_table: List[int], range_start: int,
                                  range_end: int, block_size: int):
+    tp_size = get_tensor_model_parallel_world_size()
+    if ((range_end - range_start) > 1):
+        is_prompt = 1
+    else:
+        is_prompt = 0
     for i in range(range_start, range_end):
-        block_number = block_table[i // block_size]
-        block_offset = i % block_size
+        seq_base = i // tp_size
+        num_tokens = range_end - range_start
+        num_tokens_per_XCD = math.ceil(num_tokens/tp_size)
+        seq_offset = i % num_tokens_per_XCD
+        if (is_prompt):
+            seq_loc = seq_offset
+        else:
+            seq_loc = seq_base
+        block_number = block_table[seq_loc // block_size]
+        block_offset = seq_loc % block_size
         slot = block_number * block_size + block_offset
         slot_mapping.append(slot)
 

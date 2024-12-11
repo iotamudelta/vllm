@@ -105,6 +105,8 @@ def paged_attention_v1(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    xcd_exp_sums: torch.Tensor,
+    xcd_max_logits: torch.Tensor,
     num_kv_heads: int,
     scale: float,
     block_tables: torch.Tensor,
@@ -122,7 +124,7 @@ def paged_attention_v1(
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
     torch.ops._C.paged_attention_v1(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
+        out, query, key_cache, value_cache, xcd_exp_sums, xcd_max_logits, num_kv_heads, scale, block_tables,
         seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
         k_scale, v_scale, tp_rank, blocksparse_local_blocks,
         blocksparse_vert_stride, blocksparse_block_size,

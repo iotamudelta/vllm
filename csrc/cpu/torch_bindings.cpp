@@ -20,7 +20,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "paged_attention_v1("
       "    Tensor! out, Tensor query, Tensor key_cache,"
-      "    Tensor value_cache, int num_kv_heads, float scale,"
+      "    Tensor value_cache, Tensor xcd_exp_sums, Tensor xcd_max_logits, int num_kv_heads, float scale,"
       "    Tensor block_tables, Tensor seq_lens, int block_size,"
       "    int max_seq_len, Tensor? alibi_slopes,"
       "    str kv_cache_dtype, float k_scale, float v_scale,"

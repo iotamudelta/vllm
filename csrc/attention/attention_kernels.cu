@@ -98,6 +98,8 @@ __device__ void paged_attention_kernel(
                                           // head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
                                           // head_size, block_size]
+    float* __restrict__ xcd_exp_sums,  // [num_seqs, num_heads]
+    float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads]
     const int num_kv_heads,               // [num_heads]
     const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
@@ -356,6 +358,13 @@ __device__ void paged_attention_kernel(
     *exp_sums_ptr = exp_sum;
   }
 
+  if (thread_idx == 0) {
+    float* xcd_max_logits_ptr = xcd_max_logits + seq_idx * num_heads + head_idx;
+    *xcd_max_logits_ptr = qk_max;
+    float* xcd_exp_sums_ptr = xcd_exp_sums + seq_idx * num_heads + head_idx;
+    *xcd_exp_sums_ptr = exp_sum;
+  }
+
   // Each thread will fetch 16 bytes from the value cache at a time.
   constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
   using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
@@ -506,6 +515,8 @@ __global__ void paged_attention_v1_kernel(
                                           // head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
                                           // head_size, block_size]
+    float* __restrict__ xcd_exp_sums,  // [num_seqs, num_heads]
+    float* __restrict__ xcd_max_logits,       // [num_seqs, num_heads]
     const int num_kv_heads,               // [num_heads]
     const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
@@ -519,7 +530,7 @@ __global__ void paged_attention_v1_kernel(
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
                          KV_DTYPE, IS_BLOCK_SPARSE>(
       /* exp_sums */ nullptr, /* max_logits */ nullptr, out, q, k_cache,
-      v_cache, num_kv_heads, scale, block_tables, seq_lens,
+      v_cache, xcd_exp_sums, xcd_max_logits, num_kv_heads, scale, block_tables, seq_lens,
       max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
       kv_head_stride, k_scale, v_scale, tp_rank, blocksparse_local_blocks,
       blocksparse_vert_stride, blocksparse_block_size,
@@ -554,7 +565,7 @@ __global__ void paged_attention_v2_kernel(
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
                          KV_DTYPE, IS_BLOCK_SPARSE, PARTITION_SIZE>(
-      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
+      exp_sums, max_logits, tmp_out, q, k_cache, v_cache, nullptr, nullptr, num_kv_heads, scale,
       block_tables, seq_lens, max_num_blocks_per_seq, alibi_slopes, q_stride,
       kv_block_stride, kv_head_stride, k_scale, v_scale, tp_rank,
       blocksparse_local_blocks, blocksparse_vert_stride, blocksparse_block_size,
@@ -679,7 +690,7 @@ __global__ void paged_attention_v2_reduce_kernel(
   vllm::paged_attention_v1_kernel<T, CACHE_T, HEAD_SIZE, BLOCK_SIZE,        \
                                   NUM_THREADS, KV_DTYPE, IS_BLOCK_SPARSE>   \
       <<<grid, block, shared_mem_size, stream>>>(                           \
-          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, num_kv_heads, \
+          out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, num_kv_heads, \
           scale, block_tables_ptr, seq_lens_ptr, max_num_blocks_per_seq,    \
           alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,      \
           k_scale, v_scale, tp_rank, blocksparse_local_blocks,              \
@@ -696,7 +707,7 @@ template <typename T, typename CACHE_T, int BLOCK_SIZE,
 #endif
 void paged_attention_v1_launcher(
     torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, int num_kv_heads, float scale,
+    torch::Tensor& value_cache, torch::Tensor& xcd_exp_sums, torch::Tensor& xcd_max_logits, int num_kv_heads, float scale,
     torch::Tensor& block_tables, torch::Tensor& seq_lens, int max_seq_len,
     const c10::optional<torch::Tensor>& alibi_slopes, float k_scale,
     float v_scale, const int tp_rank, const int blocksparse_local_blocks,
@@ -718,7 +729,10 @@ void paged_attention_v1_launcher(
       alibi_slopes
           ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
           : nullptr;
-
+  // ******** CHANGE CODE ***********
+  float* xcd_exp_sums_ptr = reinterpret_cast<float*>(xcd_exp_sums.data_ptr());
+  float* xcd_max_logits_ptr = reinterpret_cast<float*>(xcd_max_logits.data_ptr());
+  // ******** CHANGE CODE ***********
   T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
@@ -776,7 +790,7 @@ void paged_attention_v1_launcher(
 #define CALL_V1_LAUNCHER(T, CACHE_T, BLOCK_SIZE, KV_DTYPE, IS_BLOCK_SPARSE)  \
   paged_attention_v1_launcher<T, CACHE_T, BLOCK_SIZE, KV_DTYPE,              \
                               IS_BLOCK_SPARSE>(                              \
-      out, query, key_cache, value_cache, num_kv_heads, scale, block_tables, \
+      out, query, key_cache, value_cache, xcd_exp_sums, xcd_max_logits, num_kv_heads, scale, block_tables, \
       seq_lens, max_seq_len, alibi_slopes, k_scale, v_scale, tp_rank,        \
       blocksparse_local_blocks, blocksparse_vert_stride,                     \
       blocksparse_block_size, blocksparse_head_sliding_step);
@@ -816,6 +830,8 @@ void paged_attention_v1(
         key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
     torch::Tensor&
         value_cache,       // [num_blocks, num_heads, head_size, block_size]
+    torch::Tensor& xcd_exp_sums,    // [num_seqs, num_heads]
+    torch::Tensor& xcd_max_logits,    // [num_seqs, num_heads]
     int64_t num_kv_heads,  // [num_heads]
     double scale,
     torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]

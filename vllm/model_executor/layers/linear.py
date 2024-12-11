@@ -961,6 +961,7 @@ class QKVParallelLinearModified(ColumnParallelLinear):
 
 
 
+        tensor_offset = sum(partition_sizes[:tp_rank]) 
         if (tp_rank == 0):
             print(partition_sizes)
 
@@ -993,7 +994,7 @@ class QKVParallelLinearModified(ColumnParallelLinear):
         else:
             output = output_par
         output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return output, output_bias, tensor_offset
 
 
 class RowParallelLinear(LinearBase):
