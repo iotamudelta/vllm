@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Type, TypeVar, Union
 
 import numpy as np
 import torch
+import math
 
 from vllm.attention import (AttentionMetadata, AttentionMetadataBuilder,
                             AttentionState)

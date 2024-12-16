@@ -634,14 +634,14 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             query = query_t.view(-1, self.total_num_heads , self.head_size)
 
         #query = query.view(-1, self.num_heads, self.head_size)
-        if key is not None:
-            assert value is not None
+        if key_sub is not None:
+            assert value_sub is not None
             key = key_t.view(-1, self.total_num_kv_heads , self.head_size)
             value = value_t.view(-1, self.total_num_kv_heads , self.head_size)
          #   key = key.view(-1, self.num_kv_heads, self.head_size)
          #   value = value.view(-1, self.num_kv_heads, self.head_size)
         else:
-            assert value is None
+            assert value_sub is None
 
         if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
@@ -675,6 +675,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
         # Query for decode. KV is not needed because it is already cached.
         decode_query = query[num_prefill_tokens:]
+        num_decode_tokens = attn_metadata.num_decode_tokens
 
         # QKV for prefill.
         query = query[:num_prefill_tokens]
@@ -684,10 +685,12 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
 # ******** CHANGES MADE ***********#
         if prefill_meta := attn_metadata.prefill_metadata:
+            output = torch.empty_like(query)
             num_seqs = num_prefill_tokens
             key_prefill = key_prefill[:num_prefill_tokens]
             value_prefill = value_prefill[:num_prefill_tokens]
         if decode_meta := attn_metadata.decode_metadata:
+            output = torch.empty_like(decode_query)
             num_seqs = num_decode_tokens
 
 
@@ -813,6 +816,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             use_custom = _use_rocm_custom_paged_attention(
                 decode_query.dtype, head_size, block_size, gqa_ratio,
                 decode_meta.max_decode_seq_len)
+            use_custom = False
             if use_custom:
                 max_seq_len = (decode_meta.max_decode_seq_len
                                if attn_type != AttentionType.ENCODER_DECODER
