@@ -18,7 +18,7 @@ from vllm.platforms import current_platform
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
-                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_gather, cpx_model_parallel_all_gather, cpx_model_parallel_all_reduce,
                               tensor_model_parallel_all_reduce)
 
 if TYPE_CHECKING:
@@ -460,13 +460,13 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             raise ValueError(
                 "ROCmFlashAttention does not support attention logits soft "
                 "capping.")
-        tp_size = get_tensor_model_parallel_world_size()
+        cpx_size = 4
         self.num_heads = num_heads
-        self.total_num_heads = num_heads * tp_size
+        self.cpx_total_num_heads = num_heads * cpx_size
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
-        self.total_num_kv_heads = num_kv_heads * tp_size
+        #self.total_num_kv_heads = num_kv_heads * tp_size
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -588,36 +588,36 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         num_tokens, hidden_size = query_sub.shape
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        
+        cpx_size = 4
         positions_as_list = positions.tolist()
-        min_num_tokens_per_GPU = key_sub.size(0) // tp_size
-        num_GPUs_with_extra_token = key_sub.size(0) % tp_size        
-        partition_sizes = [0] * tp_size
-        index = positions_as_list[0]%tp_size
-        for each_slice in range(tp_size):
+        min_num_tokens_per_GPU = key_sub.size(0) // cpx_size
+        num_GPUs_with_extra_token = key_sub.size(0) % cpx_size        
+        partition_sizes = [0] * cpx_size
+        index = positions_as_list[0]%cpx_size
+        for each_slice in range(cpx_size):
             append_value = 0
             if (num_GPUs_with_extra_token > 0):
                 append_value = 1
                 num_GPUs_with_extra_token = num_GPUs_with_extra_token - 1
             append_value = append_value + min_num_tokens_per_GPU
-            partition_sizes[index%tp_size] = append_value
+            partition_sizes[index%cpx_size] = append_value
             index = index + 1
 
         tensor_offset = sum(partition_sizes[:tp_rank]) 
 
-        query_t = tensor_model_parallel_all_gather(query_sub.contiguous())
+        query_t = cpx_model_parallel_all_gather(query_sub.contiguous())
         new_key =  torch.cat([key_sub], dim=-1)
         new_value =  torch.cat([value_sub], dim=-1)
-        kg = tensor_model_parallel_all_gather(new_key.contiguous())
-        vg = tensor_model_parallel_all_gather(new_value.contiguous())
-        splitted_k = kg.split(partition_sizes, dim=0)
-        splitted_v = vg.split(partition_sizes, dim=0)
+        #kg = tensor_model_parallel_all_gather(new_key.contiguous())
+        #vg = tensor_model_parallel_all_gather(new_value.contiguous())
+        splitted_k = new_key.split(partition_sizes, dim=0)
+        splitted_v = new_value.split(partition_sizes, dim=0)
 
 
         for trk in range(len(partition_sizes)):
             k_t = torch.cat([splitted_k[trk]], dim=-1)
             v_t = torch.cat([splitted_v[trk]], dim=-1)
-            if (tp_rank == trk):
+            if (tp_rank%cpx_size == trk):
                 key_t = torch.cat([k_t], dim=-1)
                 value_t = torch.cat([v_t], dim=-1)
 
@@ -631,21 +631,21 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             key_prefill = kt.view(-1, self.num_kv_heads , self.head_size)
             value_prefill = vt.view(-1, self.num_kv_heads , self.head_size)
         if decode_meta := attn_metadata.decode_metadata:
-            query = query_t.view(-1, self.total_num_heads , self.head_size)
+            query = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
 
         #query = query.view(-1, self.num_heads, self.head_size)
         if key_sub is not None:
             assert value_sub is not None
-            key = key_t.view(-1, self.total_num_kv_heads , self.head_size)
-            value = value_t.view(-1, self.total_num_kv_heads , self.head_size)
-         #   key = key.view(-1, self.num_kv_heads, self.head_size)
-         #   value = value.view(-1, self.num_kv_heads, self.head_size)
+            #key = key_t.view(-1, self.total_num_kv_heads , self.head_size)
+            #value = value_t.view(-1, self.total_num_kv_heads , self.head_size)
+            key = key_t.view(-1, self.num_kv_heads, self.head_size)
+            value = value_t.view(-1, self.num_kv_heads, self.head_size)
         else:
             assert value_sub is None
 
         if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.total_num_kv_heads , self.head_size)
+                kv_cache, self.num_kv_heads , self.head_size)
 
             #if key is not None and value is not None:
             if (key.numel != 0):
@@ -694,7 +694,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             num_seqs = num_decode_tokens
 
 
-        XCD_exp_sums = torch.zeros(size=(num_seqs, self.total_num_heads ), dtype=torch.float32, device=output.device,)
+        XCD_exp_sums = torch.zeros(size=(num_seqs, self.cpx_total_num_heads ), dtype=torch.float32, device=output.device,)
         XCD_max_logits = torch.empty_like(XCD_exp_sums)
 # ******** CHANGES MADE ***********#
 
@@ -803,9 +803,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             # Whether to use rocm custom paged attention or not
-            modified_max_decode_seq_len = decode_meta.max_decode_seq_len // tp_size
-            decode_seq_len_offset = decode_meta.max_decode_seq_len % tp_size
-            if (tp_rank < decode_seq_len_offset):
+            modified_max_decode_seq_len = decode_meta.max_decode_seq_len // cpx_size
+            decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
+            if (tp_rank%cpx_size < decode_seq_len_offset):
                 modified_max_decode_seq_len = modified_max_decode_seq_len + 1
             modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
 
@@ -892,7 +892,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.max_encoder_seq_len,
 # ******** CHANGES MADE ***********#
                     self.kv_cache_dtype,
-                    self.total_num_kv_heads,
+                    self.num_kv_heads,
                     self.scale,
                     self.alibi_slopes,
                     k_scale,
@@ -902,8 +902,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
             # Inter-XCD Softmax aggregation code
             #   code to calculate inter-xcd m_i indicated by max_logits_final
-            inter_xcd_max_logit = tensor_model_parallel_all_gather(XCD_max_logits.contiguous())
-            per_xcd_max_logit = torch.split(inter_xcd_max_logit, self.total_num_heads , dim=1)
+            inter_xcd_max_logit = cpx_model_parallel_all_gather(XCD_max_logits.contiguous())
+            per_xcd_max_logit = torch.split(inter_xcd_max_logit, self.cpx_total_num_heads , dim=1)
             inter_xcd_max_logit_reordered = torch.stack(per_xcd_max_logit, dim=1)
             max_logits_final, _ = torch.max(inter_xcd_max_logit_reordered, dim=1)
 
@@ -914,15 +914,15 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
             per_xcd_output = output * per_xcd_exp_sums_expanded
 
-            exp_sums_final = tensor_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
-            output_aggregated = tensor_model_parallel_all_reduce(per_xcd_output.contiguous())
+            exp_sums_final = cpx_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
+            output_aggregated = cpx_model_parallel_all_reduce(per_xcd_output.contiguous())
 
             # code to calculate the final output
             exp_sums_final_expanded = exp_sums_final.unsqueeze(-1)
             final_output = output_aggregated / exp_sums_final_expanded
 
-            splitted_final_output = final_output.chunk(tp_size, dim=1)
-            output = splitted_final_output[tp_rank].to(query.dtype)
+            splitted_final_output = final_output.chunk(cpx_size, dim=1)
+            output = splitted_final_output[tp_rank%cpx_size].to(query.dtype)
 #           print(num_tokens, hidden_size, output.shape)
 # ******** CHANGES MADE ***********#
 

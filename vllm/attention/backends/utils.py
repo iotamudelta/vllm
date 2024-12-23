@@ -63,15 +63,15 @@ def compute_slot_mapping_start_idx(is_prompt: bool, query_len: int,
 def _compute_slot_mapping_python(slot_mapping: List[int],
                                  block_table: List[int], range_start: int,
                                  range_end: int, block_size: int):
-    tp_size = get_tensor_model_parallel_world_size()
+    cpx_size = 4
     if ((range_end - range_start) > 1):
         is_prompt = 1
     else:
         is_prompt = 0
     for i in range(range_start, range_end):
-        seq_base = i // tp_size
+        seq_base = i // cpx_size
         num_tokens = range_end - range_start
-        num_tokens_per_XCD = math.ceil(num_tokens/tp_size)
+        num_tokens_per_XCD = math.ceil(num_tokens/cpx_size)
         seq_offset = i % num_tokens_per_XCD
         if (is_prompt):
             seq_loc = seq_offset

@@ -149,8 +149,8 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        #self.qkv_proj = QKVParallelLinear(
-        self.qkv_proj = QKVParallelLinearModified(
+        self.qkv_proj = QKVParallelLinear(
+        #self.qkv_proj = QKVParallelLinearModified(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,

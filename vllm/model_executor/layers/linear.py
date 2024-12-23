@@ -537,7 +537,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[str] = None):
         param_data = param.data
-        print("********")
+        #print("********")
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
         is_metadata = getattr(param, "is_metadata", False)
@@ -623,9 +623,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset)
-            print("&&&&&&")
-            print(loaded_shard_id, param_data.shape, loaded_weight.shape)
-            print("&&&&&&")
+            #print("&&&&&&")
+            #print(loaded_shard_id, param_data.shape, loaded_weight.shape)
+            #print("&&&&&&")
             param_data = param_data.narrow(output_dim, shard_offset,
                                            shard_size)
             if loaded_shard_id == "q":
@@ -666,28 +666,49 @@ class QKVParallelLinear(ColumnParallelLinear):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        print(loaded_shard_id, param_data.shape, loaded_weight.shape)
-        print("********")
+        #print(loaded_shard_id, param_data.shape, loaded_weight.shape)
+        #print("********")
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, positions):
         bias = self.bias if not self.skip_bias_add else None
+        positions_as_list = positions.tolist()
 
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
-        q_sub, k_sub, v_sub = output_parallel.split([self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size], dim=-1)
+        #q_sub, k_sub, v_sub = output_parallel.split([self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size], dim=-1)
         tp_rank = get_tensor_model_parallel_rank()
-        if (tp_rank == 0):
-            print(k_sub)
+        tp_size = get_tensor_model_parallel_world_size()
+
+        min_num_tokens_per_GPU = output_parallel.size(0) // tp_size
+        num_GPUs_with_extra_token = output_parallel.size(0) % tp_size
+
+        partition_sizes = [0] * tp_size
+        index = positions_as_list[0]%tp_size
+        for each_slice in range(tp_size):
+            append_value = 0
+            if (num_GPUs_with_extra_token > 0):
+                append_value = 1
+                num_GPUs_with_extra_token = num_GPUs_with_extra_token - 1
+            append_value = append_value + min_num_tokens_per_GPU
+            partition_sizes[index%tp_size] = append_value
+            index = index + 1
+
+
+
+        tensor_offset = sum(partition_sizes[:tp_rank]) 
+
+        #if (tp_rank == 0):
+        #    print(k_sub)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return output, output_bias, tensor_offset
 
 class QKVParallelLinearModified(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
