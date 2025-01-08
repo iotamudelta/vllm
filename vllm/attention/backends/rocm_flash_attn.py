@@ -589,9 +589,10 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         cpx_size = 4
+        batch_size = len(attn_metadata.seq_lens)
         positions_as_list = positions.tolist()
-        min_num_tokens_per_GPU = key_sub.size(0) // cpx_size
-        num_GPUs_with_extra_token = key_sub.size(0) % cpx_size        
+        min_num_tokens_per_GPU = (key_sub.size(0)//batch_size) // cpx_size
+        num_GPUs_with_extra_token = (key_sub.size(0)//batch_size) % cpx_size        
         partition_sizes = [0] * cpx_size
         index = positions_as_list[0]%cpx_size
         for each_slice in range(cpx_size):
@@ -603,23 +604,28 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             partition_sizes[index%cpx_size] = append_value
             index = index + 1
 
-        tensor_offset = sum(partition_sizes[:tp_rank]) 
+        #tensor_offset = sum(partition_sizes[:tp_rank]) 
+        batch_partition_sizes = partition_sizes * batch_size
 
         query_t = cpx_model_parallel_all_gather(query_sub.contiguous())
         new_key =  torch.cat([key_sub], dim=-1)
         new_value =  torch.cat([value_sub], dim=-1)
         #kg = tensor_model_parallel_all_gather(new_key.contiguous())
         #vg = tensor_model_parallel_all_gather(new_value.contiguous())
-        splitted_k = new_key.split(partition_sizes, dim=0)
-        splitted_v = new_value.split(partition_sizes, dim=0)
+        splitted_k = new_key.split(batch_partition_sizes, dim=0)
+        splitted_v = new_value.split(batch_partition_sizes, dim=0)
+        slot_mapping_split = attn_metadata.slot_mapping.split(batch_partition_sizes, dim=0)
 
+        key_t = torch.cat([splitted_k[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
+        value_t = torch.cat([splitted_v[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
+        new_slot_mapping = torch.cat([slot_mapping_split[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
 
-        for trk in range(len(partition_sizes)):
-            k_t = torch.cat([splitted_k[trk]], dim=-1)
-            v_t = torch.cat([splitted_v[trk]], dim=-1)
-            if (tp_rank%cpx_size == trk):
-                key_t = torch.cat([k_t], dim=-1)
-                value_t = torch.cat([v_t], dim=-1)
+        #for trk in range(len(partition_sizes)):
+        #    k_t = torch.cat([splitted_k[trk]], dim=-1)
+        #    v_t = torch.cat([splitted_v[trk]], dim=-1)
+        #    if (tp_rank%cpx_size == trk):
+        #        key_t = torch.cat([k_t], dim=-1)
+        #        value_t = torch.cat([v_t], dim=-1)
 
 
         # Reshape the query, key, and value tensors.
@@ -659,7 +665,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     value,
                     key_cache,
                     value_cache,
-                    attn_metadata.slot_mapping
+                    #attn_metadata.slot_mapping
+                    new_slot_mapping
                     if attn_type != AttentionType.ENCODER_DECODER else
                     attn_metadata.cross_slot_mapping,
                     self.kv_cache_dtype,
