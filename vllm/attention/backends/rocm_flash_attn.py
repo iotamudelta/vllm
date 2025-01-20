@@ -607,7 +607,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         #tensor_offset = sum(partition_sizes[:tp_rank]) 
         batch_partition_sizes = partition_sizes * batch_size
 
-        query_t = cpx_model_parallel_all_gather(query_sub.contiguous())
         new_key =  torch.cat([key_sub], dim=-1)
         new_value =  torch.cat([value_sub], dim=-1)
         #kg = tensor_model_parallel_all_gather(new_key.contiguous())
@@ -637,6 +636,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             key_prefill = kt.view(-1, self.num_kv_heads , self.head_size)
             value_prefill = vt.view(-1, self.num_kv_heads , self.head_size)
         if decode_meta := attn_metadata.decode_metadata:
+            query_t = cpx_model_parallel_all_gather(query_sub.contiguous())
             query = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
 
         #query = query.view(-1, self.num_heads, self.head_size)
@@ -921,11 +921,17 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
             per_xcd_output = output * per_xcd_exp_sums_expanded
 
-            exp_sums_final = cpx_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
-            output_aggregated = cpx_model_parallel_all_reduce(per_xcd_output.contiguous())
+            concatenated_data = torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1)
+            final_aggregated_data = cpx_model_parallel_all_reduce(concatenated_data.contiguous())
+            last_dim = final_aggregated_data.shape[-1]
+            oa_size = last_dim - 1
+            output_aggregated, exp_sums_final_expanded = torch.split(final_aggregated_data, [oa_size, 1], dim=-1)
+
+            #exp_sums_final = cpx_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
+            #output_aggregated = cpx_model_parallel_all_reduce(per_xcd_output.contiguous())
 
             # code to calculate the final output
-            exp_sums_final_expanded = exp_sums_final.unsqueeze(-1)
+            #exp_sums_final_expanded = exp_sums_final.unsqueeze(-1)
             final_output = output_aggregated / exp_sums_final_expanded
 
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
