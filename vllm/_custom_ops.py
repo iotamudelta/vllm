@@ -175,6 +175,8 @@ def paged_attention_rocm(
     scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
+    xcd_exp_sums: torch.Tensor,
+    xcd_max_logits: torch.Tensor,
     block_size: int,
     max_seq_len: int,
     alibi_slopes: Optional[torch.Tensor],
@@ -185,7 +187,7 @@ def paged_attention_rocm(
 ) -> None:
     torch.ops._rocm_C.paged_attention(out, exp_sum, max_logits, tmp_out, query,
                                       key_cache, value_cache, num_kv_heads,
-                                      scale, block_tables, seq_lens,
+                                      scale, block_tables, seq_lens, xcd_exp_sums, xcd_max_logits,
                                       block_size, max_seq_len, alibi_slopes,
                                       kv_cache_dtype, k_scale, v_scale,
                                       fp8_out_scale)

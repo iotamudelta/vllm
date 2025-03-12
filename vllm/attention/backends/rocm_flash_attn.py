@@ -825,7 +825,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 decode_meta.max_decode_seq_len)
             use_custom = False
             if use_custom:
-                max_seq_len = (decode_meta.max_decode_seq_len
+                max_seq_len = (modified_max_decode_seq_len
                                if attn_type != AttentionType.ENCODER_DECODER
                                else decode_meta.max_encoder_seq_len)
                 assert max_seq_len is not None
@@ -867,9 +867,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.block_tables
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.cross_block_tables,
-                    decode_meta.seq_lens_tensor
+                    modified_seq_lens_tensor
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.encoder_seq_lens_tensor,
+                    XCD_exp_sums,
+                    XCD_max_logits,
                     block_size,
                     max_seq_len,
                     self.alibi_slopes,
