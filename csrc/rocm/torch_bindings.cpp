@@ -31,7 +31,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor query, Tensor key_cache,"
       "                Tensor value_cache, int num_kv_heads,"
       "                float scale, Tensor block_tables,"
-      "                Tensor context_lens, int block_size,"
+      "                Tensor context_lens, Tensor xcd_exp_sums, Tensor xcd_max_logits, int block_size,"
       "                int max_context_len,"
       "                Tensor? alibi_slopes,"
       "                str kv_cache_dtype,"
