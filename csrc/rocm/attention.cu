@@ -227,6 +227,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
     const int num_kv_heads, const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ context_lens,  // [num_seqs]
+    float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
+    float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
@@ -583,6 +585,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
       max_logits + seq_idx * num_heads * max_num_partitions + partition_idx;
   float* exp_sums_ptr =
       exp_sums + seq_idx * num_heads * max_num_partitions + partition_idx;
+
+  float* xcd_max_logits_ptr = xcd_max_logits + seq_idx * num_heads;
+  float* xcd_exp_sums_ptr = xcd_exp_sums + seq_idx * num_heads;
+
   #pragma unroll
   for (int h = 0; h < QHLOOP; h++) {
     float global_qk_max = -FLT_MAX;
@@ -604,6 +610,9 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
           global_qk_max;
       exp_sums_ptr[(wg_start_head_idx + head_idx) * max_num_partitions] =
           global_exp_sum;
+
+      xcd_max_logits_ptr[(wg_start_head_idx + head_idx)] = global_qk_max;
+      xcd_exp_sums_ptr[(wg_start_head_idx + head_idx)] = global_exp_sum;
     }
     const float global_inv_sum_scale = __fdividef(1.f, global_exp_sum + 1e-6f) *
                                        __expf(qk_max[h] - global_qk_max);
@@ -983,6 +992,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
     const int num_kv_heads, const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ context_lens,  // [num_seqs]
+    float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
+    float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
@@ -1022,7 +1033,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                    HEAD_SIZE, NTHR, GQA_RATIO>                \
       <<<grid, block, 0, stream>>>(                                           \
           query_ptr, key_cache_ptr, value_cache_ptr, num_kv_heads, scale,     \
-          block_tables_ptr, context_lens_ptr, max_num_blocks_per_seq,         \
+          block_tables_ptr, context_lens_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, max_num_blocks_per_seq,         \
           alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,        \
           exp_sums_ptr, max_logits_ptr, tmp_out_ptr, out_ptr, max_ctx_blocks, \
           k_scale, v_scale, fp8_out_scale_ptr);
