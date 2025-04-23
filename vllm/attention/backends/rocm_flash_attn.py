@@ -524,9 +524,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
     def forward(
         self,
-        query_sub: torch.Tensor,
-        key_sub: torch.Tensor,
-        value_sub: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: ROCmFlashAttentionMetadata,
         positions,
@@ -585,84 +585,87 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
 # ******** CHANGES MADE ***********#
-        num_tokens, hidden_size = query_sub.shape
+        outpu = torch.empty_like(query)
+        #print("Query shape: ", query.shape)
+
+        num_tokens, hidden_size = query.shape
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         cpx_size = 4
-        batch_size = len(attn_metadata.seq_lens)
-        positions_as_list = positions.tolist()
-        min_num_tokens_per_GPU = (key_sub.size(0)//batch_size) // cpx_size
-        num_GPUs_with_extra_token = (key_sub.size(0)//batch_size) % cpx_size        
-        partition_sizes = [0] * cpx_size
-        index = positions_as_list[0]%cpx_size
-        for each_slice in range(cpx_size):
-            append_value = 0
-            if (num_GPUs_with_extra_token > 0):
-                append_value = 1
-                num_GPUs_with_extra_token = num_GPUs_with_extra_token - 1
-            append_value = append_value + min_num_tokens_per_GPU
-            partition_sizes[index%cpx_size] = append_value
-            index = index + 1
+        batch_size = len(attn_metadata.seq_lens_tensor)
+        #positions_as_list = positions.tolist()
+        #start_index = torch.remainder(positions[0], cpx_size)
 
-        #tensor_offset = sum(partition_sizes[:tp_rank]) 
-        batch_partition_sizes = partition_sizes * batch_size
+        min_num_tokens_per_GPU = (key.size(0)//batch_size) // cpx_size
+        num_GPUs_with_extra_token = (key.size(0)//batch_size) % cpx_size
+        #start_index = positions_as_list[0]%cpx_size
 
-        new_key =  torch.cat([key_sub], dim=-1)
-        new_value =  torch.cat([value_sub], dim=-1)
-        #kg = tensor_model_parallel_all_gather(new_key.contiguous())
-        #vg = tensor_model_parallel_all_gather(new_value.contiguous())
-        splitted_k = new_key.split(batch_partition_sizes, dim=0)
-        splitted_v = new_value.split(batch_partition_sizes, dim=0)
-        slot_mapping_split = attn_metadata.slot_mapping.split(batch_partition_sizes, dim=0)
-
-        key_t = torch.cat([splitted_k[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
-        value_t = torch.cat([splitted_v[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
-        new_slot_mapping = torch.cat([slot_mapping_split[i] for i in range(len(splitted_k)) if tp_rank%cpx_size == i%cpx_size ], dim=0)
-
-        #for trk in range(len(partition_sizes)):
-        #    k_t = torch.cat([splitted_k[trk]], dim=-1)
-        #    v_t = torch.cat([splitted_v[trk]], dim=-1)
-        #    if (tp_rank%cpx_size == trk):
-        #        key_t = torch.cat([k_t], dim=-1)
-        #        value_t = torch.cat([v_t], dim=-1)
+        query_seq_lens = (key.size(0)//batch_size)
+        step_idx = torch.arange(query_seq_lens, device=outpu.device,)
+        step_to_xcd = (step_idx) % cpx_size
+        #step_to_xcd = torch.empty_like(step_idx)
+        #step_to_xcd.copy_(torch.remainder(start_index + step_idx, cpx_size))
 
 
-        # Reshape the query, key, and value tensors.
+        #local_step_mask = torch.empty_like(step_idx, dtype=torch.bool)
+        #local_step_mask.copy_((step_to_xcd == tp_rank))
+        local_step_mask = (step_to_xcd == tp_rank)
+        step_indices = torch.nonzero(local_step_mask, as_tuple=False).squeeze(-1)  # shape: [N_local_steps]
+
+        max_num_tokens_per_GPU = min_num_tokens_per_GPU + min(1, num_GPUs_with_extra_token)
+        max_num_tokens_per_GPU_across_batch = max_num_tokens_per_GPU * batch_size
+
+        key_t = torch.zeros((max_num_tokens_per_GPU_across_batch, *key.shape[1:]), dtype=key.dtype, device=outpu.device,)
+        value_t = torch.zeros((max_num_tokens_per_GPU_across_batch, *value.shape[1:]), dtype=value.dtype, device=outpu.device,)
+        new_slot_mapping = torch.zeros((max_num_tokens_per_GPU_across_batch), dtype=attn_metadata.slot_mapping.dtype, device=outpu.device,)
+
+        offset_xcd = 0
+
+        for batch_idx in range(batch_size):
+            for s in step_indices:
+                global_row_idx = batch_idx * query_seq_lens + s.item()
+                key_t[offset_xcd].copy_(key[global_row_idx])
+                value_t[offset_xcd].copy_(value[global_row_idx])
+                new_slot_mapping[offset_xcd].copy_(attn_metadata.slot_mapping[global_row_idx])
+                offset_xcd = offset_xcd + 1
+
+
+        query_t = torch.empty((*query.shape[:-1], query.shape[-1] * cpx_size), device=outpu.device, dtype=query.dtype)
+        qt = torch.empty_like(query, device=outpu.device,)
+        kt = torch.empty_like(key, device=outpu.device,)
+        vt = torch.empty_like(value, device=outpu.device,)
+
         if prefill_meta := attn_metadata.prefill_metadata:
-            qt = torch.cat([query_sub], dim=-1)
-            kt = torch.cat([key_sub], dim=-1)
-            vt = torch.cat([value_sub], dim=-1)
-            query = qt.view(-1, self.num_heads , self.head_size)
-            key_prefill = kt.view(-1, self.num_kv_heads , self.head_size)
-            value_prefill = vt.view(-1, self.num_kv_heads , self.head_size)
+            qt.copy_(query)
+            kt.copy_(key)
+            vt.copy_(value)
+            qt = qt.view(-1, self.num_heads , self.head_size)
+            kt = kt.view(-1, self.num_kv_heads , self.head_size)
+            vt = vt.view(-1, self.num_kv_heads , self.head_size)
         if decode_meta := attn_metadata.decode_metadata:
-            query_t = cpx_model_parallel_all_gather(query_sub.contiguous())
-            query = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
+            query_t.copy_(cpx_model_parallel_all_gather(query.contiguous()))
+            query_t = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
 
-        #query = query.view(-1, self.num_heads, self.head_size)
-        if key_sub is not None:
-            assert value_sub is not None
-            #key = key_t.view(-1, self.total_num_kv_heads , self.head_size)
-            #value = value_t.view(-1, self.total_num_kv_heads , self.head_size)
-            key = key_t.view(-1, self.num_kv_heads, self.head_size)
-            value = value_t.view(-1, self.num_kv_heads, self.head_size)
+        query = query.view(-1, self.num_heads, self.head_size)
+        if key is not None:
+            assert value is not None
+            key_t = key_t.view(-1, self.num_kv_heads, self.head_size)
+            value_t = value_t.view(-1, self.num_kv_heads, self.head_size)
         else:
-            assert value_sub is None
+            assert value is None
 
         if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.num_kv_heads , self.head_size)
+                kv_cache, self.num_kv_heads, self.head_size)
 
-            #if key is not None and value is not None:
-            if (key.numel != 0):
-# ******** CHANGES MADE ***********#
+            if key is not None and value is not None:
                 # Reshape the input keys and values and store them in the
                 # cache. If kv_cache is not provided, the new key and value
                 # tensors are not cached. This happens during the initial
                 # memory profiling run.
                 PagedAttention.write_to_paged_cache(
-                    key,
-                    value,
+                    key_t,
+                    value_t,
                     key_cache,
                     value_cache,
                     #attn_metadata.slot_mapping
@@ -681,37 +684,32 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             num_prefill_tokens = attn_metadata.num_encoder_tokens
 
         # Query for decode. KV is not needed because it is already cached.
-        decode_query = query[num_prefill_tokens:]
+        decode_query = query_t[num_prefill_tokens:]
+        dqt = qt[num_prefill_tokens:]
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         # QKV for prefill.
-        query = query[:num_prefill_tokens]
+        qt = qt[:num_prefill_tokens]
         if key is not None and value is not None:
-            key = key[:num_prefill_tokens]
-            value = value[:num_prefill_tokens]
+            kt = kt[:num_prefill_tokens]
+            vt = vt[:num_prefill_tokens]
 
-# ******** CHANGES MADE ***********#
         if prefill_meta := attn_metadata.prefill_metadata:
-            output = torch.empty_like(query)
             num_seqs = num_prefill_tokens
-            key_prefill = key_prefill[:num_prefill_tokens]
-            value_prefill = value_prefill[:num_prefill_tokens]
+            kt = kt[:num_prefill_tokens]
+            vt = vt[:num_prefill_tokens]
         if decode_meta := attn_metadata.decode_metadata:
-            output = torch.empty_like(decode_query)
             num_seqs = num_decode_tokens
 
-
-        XCD_exp_sums = torch.zeros(size=(num_seqs, self.cpx_total_num_heads ), dtype=torch.float32, device=output.device,)
+        XCD_exp_sums = torch.zeros(size=(num_seqs, self.cpx_total_num_heads ), dtype=torch.float32, device=outpu.device,)
         XCD_max_logits = torch.empty_like(XCD_exp_sums)
-# ******** CHANGES MADE ***********#
 
         if prefill_meta := attn_metadata.prefill_metadata:
-            output = torch.empty_like(query)
+            output = torch.empty_like(qt)
             (query_seq_start_loc, query_max_seq_len, key_seq_start_loc,
              key_max_seq_len, seq_lens,
              causal_mask) = _get_seq_len_block_table_args(
                  prefill_meta, attn_type)
-
             # Prompt run.
             if kv_cache.numel() == 0 or prefill_meta.block_tables.numel() == 0:
                 # triton attention
@@ -722,13 +720,13 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     if self.alibi_slopes is not None:
                         attn_masks = _make_alibi_bias(
                             self.alibi_slopes,
-                            query.dtype,
+                            qt.dtype,
                             seq_lens,
                             make_attn_mask=False)  # type: ignore
                     out, _ = self.attn_func(
-                        query,
-                        key_prefill,
-                        value_prefill,
+                        qt,
+                        kt,
+                        vt,
                         None,
                         query_seq_start_loc,
                         key_seq_start_loc,
@@ -742,22 +740,22 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.
-                        key = self.repeat_kv(key, self.num_queries_per_kv)
-                        value = self.repeat_kv(value, self.num_queries_per_kv)
+                        kt = self.repeat_kv(kt, self.num_queries_per_kv)
+                        vt = self.repeat_kv(vt, self.num_queries_per_kv)
                     if self.alibi_slopes is not None:
                         attn_masks = _make_alibi_bias(
                             self.alibi_slopes,
-                            query.dtype,
+                            qt.dtype,
                             attn_metadata.seq_lens,
                             make_attn_mask=True)  # type: ignore
-                    query = query.movedim(0, query.dim() - 2)
-                    key = key.movedim(0, key.dim() - 2)
-                    value = value.movedim(0, value.dim() - 2)
+                    qt = qt.movedim(0, qt.dim() - 2)
+                    kt = kt.movedim(0, kt.dim() - 2)
+                    vt = vt.movedim(0, vt.dim() - 2)
                     # sdpa math backend attention
                     out = self.attn_func(
-                        query,
-                        key,
-                        value,
+                        qt,
+                        kt,
+                        vt,
                         query_seq_start_loc,
                         num_prefill_tokens,
                         self.num_heads,
@@ -768,9 +766,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     )
                 else:
                     out = self.attn_func(
-                        q=query,
-                        k=key,
-                        v=value,
+                        q=qt,
+                        k=kt,
+                        v=vt,
                         cu_seqlens_q=query_seq_start_loc,
                         cu_seqlens_k=key_seq_start_loc,
                         max_seqlen_q=prefill_meta.max_prefill_seq_len,
@@ -790,9 +788,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             else:
                 # prefix-enabled attention
                 output[:num_prefill_tokens] = PagedAttention.forward_prefix(
-                    query,
-                    key,
-                    value,
+                    qt,
+                    kt,
+                    vt,
                     self.kv_cache_dtype,
                     key_cache,
                     value_cache,
@@ -811,19 +809,19 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             # Decoding run.
             # Whether to use rocm custom paged attention or not
             modified_max_decode_seq_len = decode_meta.max_decode_seq_len // cpx_size
-            decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
-            if (tp_rank%cpx_size < decode_seq_len_offset):
-                modified_max_decode_seq_len = modified_max_decode_seq_len + 1
+            #decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
+            #if (tp_rank%cpx_size < decode_seq_len_offset):
+            #    modified_max_decode_seq_len = modified_max_decode_seq_len + 1
             modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
+            outd = torch.empty_like(decode_query)
+            output = torch.empty_like(dqt)
 
-            output = torch.empty_like(decode_query)
             num_seqs, num_heads, head_size = decode_query.shape
             block_size = value_cache.shape[3]
             gqa_ratio = num_heads // self.num_kv_heads
             use_custom = _use_rocm_custom_paged_attention(
                 decode_query.dtype, head_size, block_size, gqa_ratio,
                 decode_meta.max_decode_seq_len)
-            use_custom = False
             if use_custom:
                 max_seq_len = (modified_max_decode_seq_len
                                if attn_type != AttentionType.ENCODER_DECODER
@@ -846,14 +844,14 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 max_logits = torch.empty_like(exp_sums)
                 cpa_fp8_out = False
                 if num_prefill_tokens > 0:
-                    out = output[num_prefill_tokens:]
+                    out = outd[num_prefill_tokens:]
                 else:
                     if fp8_out_scale is not None:
-                        out = torch.empty_like(output,
+                        out = torch.empty_like(outd,
                                                dtype=torch.float8_e4m3fnuz)
                         cpa_fp8_out = True
                     else:
-                        out = output
+                        out = outd
                 ops.paged_attention_rocm(
                     out,
                     exp_sums,
@@ -883,7 +881,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 if cpa_fp8_out:
                     return out.view(num_seqs, num_heads * head_size)
             else:
-                output[num_prefill_tokens:] = PagedAttention.forward_decode(
+                outd[num_prefill_tokens:] = PagedAttention.forward_decode(
                     decode_query,
                     key_cache,
                     value_cache,
@@ -911,33 +909,54 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
             # Inter-XCD Softmax aggregation code
             #   code to calculate inter-xcd m_i indicated by max_logits_final
-            inter_xcd_max_logit = cpx_model_parallel_all_gather(XCD_max_logits.contiguous())
-            per_xcd_max_logit = torch.split(inter_xcd_max_logit, self.cpx_total_num_heads , dim=1)
-            inter_xcd_max_logit_reordered = torch.stack(per_xcd_max_logit, dim=1)
-            max_logits_final, _ = torch.max(inter_xcd_max_logit_reordered, dim=1)
+            inter_xcd_max_logit = torch.empty((*XCD_max_logits.shape[:-1], XCD_max_logits.shape[-1] * cpx_size), dtype=XCD_max_logits.dtype, device=output.device,)
+            inter_xcd_max_logit.copy_(cpx_model_parallel_all_gather(XCD_max_logits.contiguous()))
+
+            per_xcd_max_logit = tuple(torch.empty(inter_xcd_max_logit.shape[:-1] + (self.cpx_total_num_heads,), dtype=inter_xcd_max_logit.dtype, device=output.device) for _ in range(inter_xcd_max_logit.shape[1] // self.cpx_total_num_heads))
+            for i, tensor in enumerate(torch.split(inter_xcd_max_logit, self.cpx_total_num_heads, dim=1)):
+                per_xcd_max_logit[i].copy_(tensor)
+
+            inter_xcd_max_logit_reordered = torch.empty((inter_xcd_max_logit.shape[0],inter_xcd_max_logit.shape[1] // self.cpx_total_num_heads, self.cpx_total_num_heads), dtype=inter_xcd_max_logit.dtype, device=output.device,)
+            inter_xcd_max_logit_reordered.copy_(torch.stack(per_xcd_max_logit, dim=1))
+
+            max_logits_final = torch.empty_like(XCD_max_logits, device=output.device,)
+            max_logits_final.copy_(torch.max(inter_xcd_max_logit_reordered, dim=1)[0])
 
             #   code to calculate inter-xcd l_i indicated by exp_sums_final and aggregated output indicated by output_aggregated
-            delta_logits = XCD_max_logits - max_logits_final
-            alpha = torch.exp(delta_logits)
-            per_xcd_exp_sums = torch.mul(alpha, XCD_exp_sums)
-            per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
-            per_xcd_output = output * per_xcd_exp_sums_expanded
+            delta_logits = torch.empty_like(XCD_max_logits, device=output.device,)
+            delta_logits.copy_(XCD_max_logits - max_logits_final)
 
-            concatenated_data = torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1)
-            final_aggregated_data = cpx_model_parallel_all_reduce(concatenated_data.contiguous())
+            alpha = torch.empty_like(XCD_max_logits, device=output.device,)
+            alpha.copy_(torch.exp(delta_logits))
+
+            per_xcd_exp_sums = torch.empty_like(XCD_exp_sums, device=output.device,)
+            per_xcd_exp_sums.copy_(torch.mul(alpha, XCD_exp_sums))
+            per_xcd_exp_sums_expanded = torch.empty((*XCD_exp_sums.shape, 1), device=output.device,)
+            per_xcd_exp_sums_expanded.copy_(per_xcd_exp_sums.unsqueeze(-1))
+
+            per_xcd_output = torch.empty_like(outd, device=output.device,)
+            per_xcd_output.copy_(outd * per_xcd_exp_sums_expanded)
+
+            concatenated_data = torch.empty(outd.shape[:-1] + (outd.shape[-1] + 1,), device=output.device)
+            concatenated_data.copy_(torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1))
+
+            final_aggregated_data = torch.empty_like(concatenated_data, device=output.device,)
+            final_aggregated_data.copy_(cpx_model_parallel_all_reduce(concatenated_data.contiguous()))
             last_dim = final_aggregated_data.shape[-1]
             oa_size = last_dim - 1
-            output_aggregated, exp_sums_final_expanded = torch.split(final_aggregated_data, [oa_size, 1], dim=-1)
 
-            #exp_sums_final = cpx_model_parallel_all_reduce(per_xcd_exp_sums.contiguous())
-            #output_aggregated = cpx_model_parallel_all_reduce(per_xcd_output.contiguous())
+            output_aggregated = torch.empty((outd.shape[:-1] + (outd.shape[-1],)), device=output.device,)
+            exp_sums_final_expanded = torch.empty((outd.shape[:-1] + (1,)), device=output.device,)
+            output_aggregated.copy_(torch.split(final_aggregated_data, [oa_size, 1], dim=-1)[0])
+            exp_sums_final_expanded.copy_(torch.split(final_aggregated_data, [oa_size, 1], dim=-1)[1])
 
             # code to calculate the final output
-            #exp_sums_final_expanded = exp_sums_final.unsqueeze(-1)
-            final_output = output_aggregated / exp_sums_final_expanded
+            final_output = torch.empty_like(outd, device=output.device,)
+            final_output.copy_(output_aggregated / exp_sums_final_expanded)
 
+            splitted_final_output = [torch.empty_like(output, device=output.device,) for _ in range(cpx_size)]
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
-            output = splitted_final_output[tp_rank%cpx_size].to(query.dtype)
+            output.copy_(splitted_final_output[tp_rank%cpx_size].squeeze(1).to(query.dtype))
 #           print(num_tokens, hidden_size, output.shape)
 # ******** CHANGES MADE ***********#
 

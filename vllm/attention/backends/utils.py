@@ -64,19 +64,8 @@ def _compute_slot_mapping_python(slot_mapping: List[int],
                                  block_table: List[int], range_start: int,
                                  range_end: int, block_size: int):
     cpx_size = 4
-    if ((range_end - range_start) > 1):
-        is_prompt = 1
-    else:
-        is_prompt = 0
     for i in range(range_start, range_end):
-        seq_base = i // cpx_size
-        num_tokens = range_end - range_start
-        num_tokens_per_XCD = math.ceil(num_tokens/cpx_size)
-        seq_offset = i % num_tokens_per_XCD
-        if (is_prompt):
-            seq_loc = seq_offset
-        else:
-            seq_loc = seq_base
+        seq_loc = i // cpx_size
         block_number = block_table[seq_loc // block_size]
         block_offset = seq_loc % block_size
         slot = block_number * block_size + block_offset
@@ -88,20 +77,8 @@ def _compute_slot_mapping_numpy(slot_mapping: List[int],
                                 range_end: int, block_size: int):
     block_table_array = np.array(block_table)
     cpx_size = 4
-    if ((range_end - range_start) > 1):
-        is_prompt = 1
-    else:
-        is_prompt = 0
-
     idx = np.arange(range_start, range_end)
-    seq_base = idx // cpx_size
-    num_tokens = range_end - range_start
-    num_tokens_per_XCD = math.ceil(num_tokens/cpx_size)
-    seq_offset = idx % num_tokens_per_XCD
-    if (is_prompt):
-        seq_loc = seq_offset
-    else:
-        seq_loc = seq_base
+    seq_loc = idx // cpx_size
     block_offset = seq_loc % block_size
     seq_loc //= block_size
     seq_slot_mapping_array = block_table_array[seq_loc]

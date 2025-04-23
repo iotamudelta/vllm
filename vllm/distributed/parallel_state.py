@@ -911,7 +911,7 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group(
+    with get_tp_group().graph_capture() as context, get_cp_group().graph_capture(context), get_pp_group(
     ).graph_capture(context):
         yield context
 
@@ -1145,6 +1145,10 @@ def destroy_model_parallel():
         _PP.destroy()
     _PP = None
 
+    global _CP
+    if _CP:
+        _CP.destroy()
+    _CP = None
 
 def destroy_distributed_environment():
     global _WORLD
