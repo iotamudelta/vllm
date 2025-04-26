@@ -593,42 +593,45 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         tp_size = get_tensor_model_parallel_world_size()
         cpx_size = 4
         batch_size = len(attn_metadata.seq_lens_tensor)
-        #positions_as_list = positions.tolist()
-        #start_index = torch.remainder(positions[0], cpx_size)
 
         min_num_tokens_per_GPU = (key.size(0)//batch_size) // cpx_size
         num_GPUs_with_extra_token = (key.size(0)//batch_size) % cpx_size
-        #start_index = positions_as_list[0]%cpx_size
 
         query_seq_lens = (key.size(0)//batch_size)
-        step_idx = torch.arange(query_seq_lens, device=outpu.device,)
-        step_to_xcd = (step_idx) % cpx_size
-        #step_to_xcd = torch.empty_like(step_idx)
-        #step_to_xcd.copy_(torch.remainder(start_index + step_idx, cpx_size))
-
-
-        #local_step_mask = torch.empty_like(step_idx, dtype=torch.bool)
-        #local_step_mask.copy_((step_to_xcd == tp_rank))
-        local_step_mask = (step_to_xcd == tp_rank)
-        step_indices = torch.nonzero(local_step_mask, as_tuple=False).squeeze(-1)  # shape: [N_local_steps]
-
         max_num_tokens_per_GPU = min_num_tokens_per_GPU + min(1, num_GPUs_with_extra_token)
         max_num_tokens_per_GPU_across_batch = max_num_tokens_per_GPU * batch_size
+        new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
+        key_reshaped = torch.empty((batch_size, query_seq_lens, *key.shape[1:]), dtype=key.dtype, device=outpu.device,)
+        value_reshaped = torch.empty((batch_size, query_seq_lens, *value.shape[1:]), dtype=value.dtype, device=outpu.device,)
+        slot_mapping_reshaped = torch.empty((batch_size, query_seq_lens), dtype=attn_metadata.slot_mapping.dtype, device=outpu.device,)
 
-        key_t = torch.zeros((max_num_tokens_per_GPU_across_batch, *key.shape[1:]), dtype=key.dtype, device=outpu.device,)
-        value_t = torch.zeros((max_num_tokens_per_GPU_across_batch, *value.shape[1:]), dtype=value.dtype, device=outpu.device,)
-        new_slot_mapping = torch.zeros((max_num_tokens_per_GPU_across_batch), dtype=attn_metadata.slot_mapping.dtype, device=outpu.device,)
+        key_r = torch.zeros((batch_size, new_seq, *key.shape[1:]), dtype=key.dtype, device=outpu.device,)
+        value_r = torch.zeros((batch_size, new_seq, *value.shape[1:]), dtype=value.dtype, device=outpu.device,)
+        slot_mapping_r = torch.zeros((batch_size, new_seq), dtype=attn_metadata.slot_mapping.dtype, device=outpu.device,)
 
-        offset_xcd = 0
+        key_reshaped.copy_(key.view(batch_size, query_seq_lens, *key.shape[1:]))
+        value_reshaped.copy_(value.view(batch_size, query_seq_lens, *value.shape[1:]))
+        slot_mapping_reshaped.copy_(attn_metadata.slot_mapping.view(batch_size, query_seq_lens))
 
-        for batch_idx in range(batch_size):
-            for s in step_indices:
-                global_row_idx = batch_idx * query_seq_lens + s.item()
-                key_t[offset_xcd].copy_(key[global_row_idx])
-                value_t[offset_xcd].copy_(value[global_row_idx])
-                new_slot_mapping[offset_xcd].copy_(attn_metadata.slot_mapping[global_row_idx])
-                offset_xcd = offset_xcd + 1
+        key_r[:, :query_seq_lens, :].copy_(key_reshaped)
+        value_r[:, :query_seq_lens, :].copy_(value_reshaped)
+        slot_mapping_r[:, :query_seq_lens].copy_(slot_mapping_reshaped)
 
+        if prefill_meta := attn_metadata.prefill_metadata:
+            start_idx = 0
+        if decode_meta := attn_metadata.decode_metadata:
+            start_idx = (decode_meta.max_decode_seq_len - 1) % cpx_size
+
+        slice_len = new_seq // cpx_size
+        slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
+
+        key_t = key_r.narrow(dim=1, start=slice_idx, length=slice_len)
+        value_t = value_r.narrow(dim=1, start=slice_idx, length=slice_len)
+        new_slot_mapping = slot_mapping_r.narrow(dim=1, start=slice_idx, length=slice_len)
+
+        key_t = key_t.contiguous().view(batch_size * slice_len, *key.shape[1:])
+        value_t = value_t.contiguous().view(batch_size * slice_len, *value.shape[1:])
+        new_slot_mapping = new_slot_mapping.contiguous().view(batch_size * slice_len)
 
         query_t = torch.empty((*query.shape[:-1], query.shape[-1] * cpx_size), device=outpu.device, dtype=query.dtype)
         qt = torch.empty_like(query, device=outpu.device,)
@@ -809,7 +812,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             # Decoding run.
             # Whether to use rocm custom paged attention or not
             modified_max_decode_seq_len = decode_meta.max_decode_seq_len // cpx_size
-            #decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
+            decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
+###### TBD This is a temporary hack; need to be examined
+            decode_adder = min(1,decode_seq_len_offset)
+            modified_max_decode_seq_len = modified_max_decode_seq_len + decode_adder
+###### TBD This is a temporary hack; need to be examined
             #if (tp_rank%cpx_size < decode_seq_len_offset):
             #    modified_max_decode_seq_len = modified_max_decode_seq_len + 1
             modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
@@ -958,6 +965,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
             output.copy_(splitted_final_output[tp_rank%cpx_size].squeeze(1).to(query.dtype))
 #           print(num_tokens, hidden_size, output.shape)
+
 # ******** CHANGES MADE ***********#
 
         # Reshape the output tensor.

@@ -65,7 +65,7 @@ def _compute_slot_mapping_python(slot_mapping: List[int],
                                  range_end: int, block_size: int):
     cpx_size = 4
     for i in range(range_start, range_end):
-        seq_loc = i // cpx_size
+        seq_loc = i % cpx_size
         block_number = block_table[seq_loc // block_size]
         block_offset = seq_loc % block_size
         slot = block_number * block_size + block_offset
@@ -78,7 +78,7 @@ def _compute_slot_mapping_numpy(slot_mapping: List[int],
     block_table_array = np.array(block_table)
     cpx_size = 4
     idx = np.arange(range_start, range_end)
-    seq_loc = idx // cpx_size
+    seq_loc = idx % cpx_size
     block_offset = seq_loc % block_size
     seq_loc //= block_size
     seq_slot_mapping_array = block_table_array[seq_loc]
