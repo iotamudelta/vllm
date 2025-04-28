@@ -642,7 +642,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             qt.copy_(query)
             kt.copy_(key)
             vt.copy_(value)
-            qt = qt.view(-1, self.num_heads , self.head_size)
             kt = kt.view(-1, self.num_kv_heads , self.head_size)
             vt = vt.view(-1, self.num_kv_heads , self.head_size)
         if decode_meta := attn_metadata.decode_metadata:
@@ -650,6 +649,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             query_t = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
 
         query = query.view(-1, self.num_heads, self.head_size)
+        qt = qt.view(-1, self.num_heads , self.head_size)
         if key is not None:
             assert value is not None
             key_t = key_t.view(-1, self.num_kv_heads, self.head_size)
@@ -963,7 +963,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
             splitted_final_output = [torch.empty_like(output, device=output.device,) for _ in range(cpx_size)]
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
-            output.copy_(splitted_final_output[tp_rank%cpx_size].squeeze(1).to(query.dtype))
+            output.copy_(splitted_final_output[tp_rank%cpx_size].to(query.dtype))
 #           print(num_tokens, hidden_size, output.shape)
 
 # ******** CHANGES MADE ***********#
