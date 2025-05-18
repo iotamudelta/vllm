@@ -898,13 +898,15 @@ def reshape_and_cache(
     value: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    location_match: bool,
+    slot_mapping_dummy: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
 ) -> None:
     torch.ops._C_cache_ops.reshape_and_cache(key, value, key_cache,
-                                             value_cache, slot_mapping,
+                                             value_cache, location_match, slot_mapping_dummy, slot_mapping,
                                              kv_cache_dtype, k_scale, v_scale)
 
 

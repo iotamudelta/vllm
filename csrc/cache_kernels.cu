@@ -257,7 +257,7 @@ __global__ void reshape_and_cache_flash_kernel(
           reinterpret_cast<KV_T*>(value.data_ptr()),                  \
           reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
-          slot_mapping.data_ptr<int64_t>(), key_stride, value_stride, \
+          selected_slot_mapping, key_stride, value_stride, \
           num_heads, head_size, block_size, x, k_scale, v_scale);
 
 void reshape_and_cache(
@@ -267,6 +267,8 @@ void reshape_and_cache(
         key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
     torch::Tensor&
         value_cache,  // [num_blocks, num_heads, head_size, block_size]
+    const bool location_match,
+    torch::Tensor& slot_mapping_dummy,  // [num_tokens]
     torch::Tensor& slot_mapping,  // [num_tokens]
     const std::string& kv_cache_dtype, const double k_scale,
     const double v_scale) {
@@ -278,6 +280,8 @@ void reshape_and_cache(
 
   int key_stride = key.stride(0);
   int value_stride = value.stride(0);
+
+  int64_t* selected_slot_mapping = location_match ? slot_mapping.data_ptr<int64_t>() : slot_mapping_dummy.data_ptr<int64_t>();
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
