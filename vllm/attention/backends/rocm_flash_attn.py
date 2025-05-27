@@ -651,7 +651,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             kt = kt.view(-1, self.num_kv_heads , self.head_size)
             vt = vt.view(-1, self.num_kv_heads , self.head_size)
         if decode_meta := attn_metadata.decode_metadata:
-            query_t.copy_(cpx_model_parallel_all_gather(query.contiguous()))
+            query_t = cpx_model_parallel_all_gather(query.contiguous())
             query_t = query_t.view(-1, self.cpx_total_num_heads , self.head_size)
 ###############################################
 ###############################################
@@ -722,7 +722,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             num_seqs = num_decode_tokens
 
-        XCD_exp_sums = torch.zeros(size=(num_seqs, self.cpx_total_num_heads ), dtype=torch.float32, device=outpu.device,)
+        XCD_exp_sums = torch.empty(size=(num_seqs, self.cpx_total_num_heads ), dtype=torch.float32, device=outpu.device,)
         XCD_max_logits = torch.empty_like(XCD_exp_sums)
 
         if prefill_meta := attn_metadata.prefill_metadata:
@@ -832,11 +832,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             modified_max_decode_seq_len = decode_meta.max_decode_seq_len // cpx_size
             decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
 ###### TBD This is a temporary hack; need to be examined
-            decode_adder = min(1,decode_seq_len_offset)
-            modified_max_decode_seq_len = modified_max_decode_seq_len + decode_adder
+#            decode_adder = min(1,decode_seq_len_offset)
+#            modified_max_decode_seq_len = modified_max_decode_seq_len + decode_adder
 ###### TBD This is a temporary hack; need to be examined
-            #if (tp_rank%cpx_size < decode_seq_len_offset):
-            #    modified_max_decode_seq_len = modified_max_decode_seq_len + 1
+            if(tp_rank%cpx_size < decode_seq_len_offset):
+                modified_max_decode_seq_len = modified_max_decode_seq_len + 1
             modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
             outd = torch.empty_like(decode_query)
             output = torch.empty_like(dqt)
@@ -890,7 +890,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.block_tables
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.cross_block_tables,
-                    modified_seq_lens_tensor
+                    decode_meta.seq_lens_tensor
+                    #modified_seq_lens_tensor
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.encoder_seq_lens_tensor,
                     XCD_exp_sums,
@@ -914,7 +915,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.cross_block_tables,
 # ******** CHANGES MADE ***********#
-                    modified_seq_lens_tensor
+                    decode_meta.seq_lens_tensor
+                    #modified_seq_lens_tensor
                     if attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.encoder_seq_lens_tensor,
                     XCD_exp_sums,

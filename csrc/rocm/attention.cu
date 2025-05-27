@@ -250,7 +250,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
   const int partition_size = blockDim.x;
   const int max_num_partitions = gridDim.y;
 
-  const int context_len = context_lens[seq_idx];
+  const int context_len = 1 + (context_lens[seq_idx] / 4);
   const int partition_start_token_idx = partition_idx * partition_size;
   // exit if partition is out of context for seq
   if (partition_start_token_idx >= context_len) {
@@ -783,7 +783,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const int num_heads = gridDim.x;
   const int head_idx = blockIdx.x;
   const int seq_idx = blockIdx.y;
-  const int context_len = context_lens[seq_idx];
+  const int context_len = 1 + (context_lens[seq_idx] / 4);
   const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
   if (num_partitions == 1) {
     // if num_partitions==1, main kernel will write to out directly, no work in
