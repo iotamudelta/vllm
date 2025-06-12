@@ -38,6 +38,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                float k_scale, float v_scale,"
       "                Tensor? fp8_out_scale) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // Custom reduction op
+  rocm_ops.def(
+      "paged_reduction(Tensor! out, Tensor exp_sums,"
+      "                Tensor max_logits, Tensor tmp_out,"
+      "                Tensor query, Tensor key_cache,"
+      "                Tensor value_cache, int num_kv_heads,"
+      "                float scale, Tensor block_tables,"
+      "                Tensor context_lens, Tensor xcd_exp_sums, Tensor xcd_max_logits, int block_size,"
+      "                int max_context_len,"
+      "                Tensor? alibi_slopes,"
+      "                str kv_cache_dtype,"
+      "                float k_scale, float v_scale,"
+      "                Tensor? fp8_out_scale) -> ()");
+  rocm_ops.impl("paged_reduction", torch::kCUDA, &paged_reduction);
+
   rocm_ops.def(
       "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"
       "        int CuCount) -> ()");

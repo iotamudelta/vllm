@@ -837,7 +837,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 ###### TBD This is a temporary hack; need to be examined
             if(tp_rank%cpx_size < decode_seq_len_offset):
                 modified_max_decode_seq_len = modified_max_decode_seq_len + 1
-            modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, modified_max_decode_seq_len)
+            context_len_desired = ((_PARTITION_SIZE_ROCM * cpx_size)-1) * cpx_size
+            modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, context_len_desired)
             outd = torch.empty_like(decode_query)
             output = torch.empty_like(dqt)
 
@@ -933,6 +934,74 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     v_scale,
                 )
 # ******** CHANGES MADE ***********#
+            XCD_max_logits_2 = torch.empty_like(XCD_exp_sums)
+            XCD_exp_sums_2 = torch.empty_like(XCD_exp_sums)
+            outd2 = torch.empty_like(outd, device=output.device,)
+            XCD_exp_sums_2.copy_(XCD_exp_sums)
+            XCD_max_logits_2.copy_(XCD_max_logits)
+            outd2.copy_(outd)
+
+            xcd_exp_sums_expanded = XCD_exp_sums_2.unsqueeze(-1)
+            xcd_max_logits_expanded = XCD_max_logits_2.unsqueeze(-1)
+            Final_output = torch.cat((outd2, xcd_exp_sums_expanded, xcd_max_logits_expanded), dim=-1)
+            #if (tp_rank == 0):
+            #    print(Final_output.shape)
+            #    print(Final_output)
+
+            Final_output = Final_output.unsqueeze(2)
+            Final_output_gathered = cpx_model_parallel_all_gather(Final_output.contiguous(), dim=2)
+
+            cpa_fp8_out = False
+            #tmp_output_gathered = Final_output_gathered.narrow(dim=-1, start=0, length=self.head_size).contiguous()
+            #exp_sums_gathered = Final_output_gathered.narrow(dim=-1, start=head_size, length=1).squeeze(-1).contiguous()
+            #max_logits_gathered = Final_output_gathered.narrow(dim=-1, start=head_size+1, length=1).squeeze(-1).contiguous()
+
+            tmp_output_gathered, exp_sums, max_logits = torch.split(Final_output_gathered, [self.head_size, 1, 1], dim=-1)
+            exp_sums_gathered = exp_sums.squeeze(-1).contiguous()
+            max_logits_gathered = max_logits.squeeze(-1).contiguous()
+            tmp_output_gathered = tmp_output_gathered.contiguous()
+
+
+            final_output_2 = torch.empty_like(outd, device=output.device,)
+            final_output_t = final_output_2[num_prefill_tokens:]
+
+            #if (tp_rank == 0):
+            #        print("Reduction_ROCM", exp_sums_gathered.shape, max_logits_gathered.shape, tmp_output_gathered.shape)
+            #    print(tmp_output_gathered.shape, exp_sums_gathered.shape, max_logits_gathered.shape)
+            #    print(tmp_output_gathered)
+            #    print(decode_meta.seq_lens_tensor)
+            #    print(exp_sums_gathered)
+                #print(modified_seq_lens_tensor)
+            #    print(final_output.shape, tmp_output_gathered.shape, exp_sums_gathered.shape, max_logits_gathered.shape)
+
+            ops.paged_reduction_rocm(
+                final_output_t,
+                exp_sums_gathered,
+                max_logits_gathered,
+                tmp_output_gathered,
+                decode_query,
+                key_cache,
+                value_cache,
+                self.num_kv_heads,
+                self.scale,
+                decode_meta.block_tables
+                if attn_type != AttentionType.ENCODER_DECODER else
+                decode_meta.cross_block_tables,
+                #decode_meta.seq_lens_tensor
+                modified_seq_lens_tensor
+                if attn_type != AttentionType.ENCODER_DECODER else
+                decode_meta.encoder_seq_lens_tensor,
+                XCD_exp_sums,
+                XCD_max_logits,
+                block_size,
+                #max_seq_len below is replaced with cpx_size
+                cpx_size,
+                self.alibi_slopes,
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+                fp8_out_scale if cpa_fp8_out else None,
+            )
 
             # Inter-XCD Softmax aggregation code
             #   code to calculate inter-xcd m_i indicated by max_logits_final
