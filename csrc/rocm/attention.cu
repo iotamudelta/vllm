@@ -229,6 +229,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
     const int* __restrict__ context_lens,  // [num_seqs]
     float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
     float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
+    const int starscream_rank,
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
@@ -250,7 +251,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
   const int partition_size = blockDim.x;
   const int max_num_partitions = gridDim.y;
 
-  const int context_len = 1 + (context_lens[seq_idx] / 4);
+  const int base_ctx = (context_lens[seq_idx] / 4);
+  const int remainder_ctx = (context_lens[seq_idx] % 4);
+
+  const int context_len = base_ctx + (starscream_rank < remainder_ctx);
   const int partition_start_token_idx = partition_idx * partition_size;
   // exit if partition is out of context for seq
   if (partition_start_token_idx >= context_len) {
@@ -779,11 +783,19 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     const int* __restrict__ context_lens,  // [num_seqs]
     float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
     float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
+    const int starscream_rank,
     const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
   const int num_heads = gridDim.x;
   const int head_idx = blockIdx.x;
   const int seq_idx = blockIdx.y;
-  const int context_len = 1 + (context_lens[seq_idx] / 4);
+
+  const int base_ctx = (context_lens[seq_idx] / 4);
+  const int remainder_ctx = (context_lens[seq_idx] % 4);
+
+  const int context_len = base_ctx + (starscream_rank < remainder_ctx);
+  
+
+//  const int context_len = 1 + (context_lens[seq_idx] / 4);
   const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
   if (num_partitions == 1) {
     // if num_partitions==1, main kernel will write to out directly, no work in
@@ -877,6 +889,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const scalar_t* tmp_out_ptr =
       tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
+  //if (blockIdx.x == 0 && blockIdx.y == 0){
+//	  printf("tmp data (Thread Id, value): %d %f\n",threadIdx.x, to_float<scalar_t>(tmp_out_ptr[0]));
+  //}
   constexpr int MAX_NPAR = 64;
   scalar_t tmps[MAX_NPAR];
   const float dzero = 0.0f;
@@ -994,6 +1009,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
     const int* __restrict__ context_lens,  // [num_seqs]
     float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
     float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
+    const int starscream_rank,
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
@@ -1023,6 +1039,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     const int* __restrict__ context_lens,  // [num_seqs]
     float* __restrict__ xcd_exp_sums,    // [num_seqs, num_heads,
     float* __restrict__ xcd_max_logits,  // [num_seqs, num_heads,
+    const int starscream_rank,
     const int max_num_partitions,
     const float* __restrict__ fp8_out_scale_ptr){UNREACHABLE_CODE}
 
@@ -1033,7 +1050,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                    HEAD_SIZE, NTHR, GQA_RATIO>                \
       <<<grid, block, 0, stream>>>(                                           \
           query_ptr, key_cache_ptr, value_cache_ptr, num_kv_heads, scale,     \
-          block_tables_ptr, context_lens_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, max_num_blocks_per_seq,         \
+          block_tables_ptr, context_lens_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, starscream_rank, max_num_blocks_per_seq,         \
           alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,        \
           exp_sums_ptr, max_logits_ptr, tmp_out_ptr, out_ptr, max_ctx_blocks, \
           k_scale, v_scale, fp8_out_scale_ptr);
@@ -1043,7 +1060,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                       PARTITION_SIZE, NPAR_LOOPS>    \
       <<<reduce_grid, reduce_block, 0, stream>>>(                    \
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr,        \
-          context_lens_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, max_num_partitions, fp8_out_scale_ptr);
+          context_lens_ptr, xcd_exp_sums_ptr, xcd_max_logits_ptr, starscream_rank, max_num_partitions, fp8_out_scale_ptr);
 
 template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE, int HEAD_SIZE, typename OUTT,
@@ -1052,7 +1069,7 @@ void paged_attention_custom_launcher(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
     torch::Tensor& value_cache, const int num_kv_heads, float scale,
-    torch::Tensor& block_tables, torch::Tensor& context_lens, torch::Tensor& xcd_exp_sums, torch::Tensor& xcd_max_logits,
+    torch::Tensor& block_tables, torch::Tensor& context_lens, torch::Tensor& xcd_exp_sums, torch::Tensor& xcd_max_logits, int starscream_rank,
     int max_context_len, const c10::optional<torch::Tensor>& alibi_slopes,
     float k_scale, float v_scale,
     const c10::optional<torch::Tensor>& fp8_out_scale) {
@@ -1191,7 +1208,7 @@ void paged_attention_custom_launcher(
   paged_attention_custom_launcher<T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE,  \
                                   OUTT>(                                  \
       out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
-      num_kv_heads, scale, block_tables, context_lens, xcd_exp_sums, xcd_max_logits, max_context_len,   \
+      num_kv_heads, scale, block_tables, context_lens, xcd_exp_sums, xcd_max_logits, starscream_rank, max_context_len,   \
       alibi_slopes, k_scale, v_scale, fp8_out_scale);
 
 #define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)   \
@@ -1243,6 +1260,7 @@ void paged_attention(
     torch::Tensor& context_lens,  // [num_seqs]
     torch::Tensor& xcd_exp_sums,  // [num_seqs]
     torch::Tensor& xcd_max_logits,  // [num_seqs]
+    int64_t starscream_rank,
     int64_t block_size, int64_t max_context_len,
     const c10::optional<torch::Tensor>& alibi_slopes,
     const std::string& kv_cache_dtype, double k_scale, double v_scale,
@@ -1264,6 +1282,179 @@ void paged_attention(
                                     vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (query.dtype() == at::ScalarType::BFloat16) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, uint8_t,
+                                    vllm::Fp8KVCacheDataType::kFp8E4M3);
+    } else {
+      TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+    }
+  } else {
+    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+  }
+}
+
+template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
+          int BLOCK_SIZE, int HEAD_SIZE, typename OUTT,
+          int PARTITION_SIZE = 512>
+void paged_attention_custom_launcher_r(
+    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
+    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, const int num_kv_heads, float scale,
+    torch::Tensor& block_tables, torch::Tensor& context_lens, torch::Tensor& xcd_exp_sums, torch::Tensor& xcd_max_logits, int starscream_rank,
+    int max_context_len, const c10::optional<torch::Tensor>& alibi_slopes,
+    float k_scale, float v_scale,
+    const c10::optional<torch::Tensor>& fp8_out_scale) {
+  int num_seqs = query.size(0);
+  int num_heads = query.size(1);
+  int head_size = query.size(2);
+  int max_num_blocks_per_seq = block_tables.size(1);
+  int q_stride = query.stride(0);
+  int kv_block_stride = key_cache.stride(0);
+  int kv_head_stride = key_cache.stride(1);
+
+  // NOTE: alibi_slopes is optional.
+  const float* alibi_slopes_ptr =
+      alibi_slopes
+          ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          : nullptr;
+
+  float* xcd_exp_sums_ptr = reinterpret_cast<float*>(xcd_exp_sums.data_ptr());
+  float* xcd_max_logits_ptr = reinterpret_cast<float*>(xcd_max_logits.data_ptr());
+  float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
+  float* max_logits_ptr = reinterpret_cast<float*>(max_logits.data_ptr());
+  T* tmp_out_ptr = reinterpret_cast<T*>(tmp_out.data_ptr());
+  T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
+  KVT* key_cache_ptr = reinterpret_cast<KVT*>(key_cache.data_ptr());
+  KVT* value_cache_ptr = reinterpret_cast<KVT*>(value_cache.data_ptr());
+  int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* context_lens_ptr = context_lens.data_ptr<int>();
+
+  // NOTE: fp8_out_scale is optional.
+  const float* fp8_out_scale_ptr =
+      fp8_out_scale
+          ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr())
+          : nullptr;
+  OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
+
+  const int max_ctx_blocks = DIVIDE_ROUND_UP(max_context_len, BLOCK_SIZE);
+  const int max_num_partitions = max_context_len;
+  const int gqa_ratio = num_heads / num_kv_heads;
+  assert(num_heads % num_kv_heads == 0);
+  assert(head_size == HEAD_SIZE);
+  assert(max_num_partitions <= 256);
+
+  constexpr int NTHR = PARTITION_SIZE;
+  dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+  dim3 block(NTHR);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  // dim3 grid2(num_heads,num_seqs,head_size/HEAD_ELEMS_PER_WG);
+  // dim3 block2(1024);
+  //  LAUNCH_CUSTOM_ATTENTION2;
+
+  // reduction kernel is only required if max_context_len > partition size,
+  // otherwise main kernel writes directly to final output
+  //  note there are cases with graphing where max_context_len is the max
+  //  supported by graphing, not the actual max among all the sequences: in that
+  //  case reduction kernel will still run but return immediately
+  dim3 reduce_grid(num_heads, num_seqs);
+  dim3 reduce_block(head_size);
+  const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+  switch (npar_loops) {
+    case 1:
+      LAUNCH_CUSTOM_REDUCTION(1);
+      break;
+    case 2:
+      LAUNCH_CUSTOM_REDUCTION(2);
+      break;
+    case 3:
+      LAUNCH_CUSTOM_REDUCTION(3);
+      break;
+    case 4:
+      LAUNCH_CUSTOM_REDUCTION(4);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
+      break;
+  }
+}
+
+#define CALL_CUSTOM_LAUNCHER_R(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT) \
+  paged_attention_custom_launcher_r<T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE,  \
+                                  OUTT>(                                  \
+      out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
+      num_kv_heads, scale, block_tables, context_lens, xcd_exp_sums, xcd_max_logits, starscream_rank, max_context_len,   \
+      alibi_slopes, k_scale, v_scale, fp8_out_scale);
+
+#define CALL_CUSTOM_LAUNCHER_OUT_R(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)   \
+  if (fp8_out_scale) {                                                    \
+    CALL_CUSTOM_LAUNCHER_R(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, uint8_t); \
+  } else {                                                                \
+    CALL_CUSTOM_LAUNCHER_R(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T);       \
+  }
+
+#define CALL_CUSTOM_LAUNCHER_BLK_R(T, KVT, KV_DTYPE, HEAD_SIZE)     \
+  switch (block_size) {                                           \
+    case 16:                                                      \
+      CALL_CUSTOM_LAUNCHER_OUT_R(T, KVT, KV_DTYPE, 16, HEAD_SIZE);  \
+      break;                                                      \
+    case 32:                                                      \
+      CALL_CUSTOM_LAUNCHER_OUT_R(T, KVT, KV_DTYPE, 32, HEAD_SIZE);  \
+      break;                                                      \
+    default:                                                      \
+      TORCH_CHECK(false, "Unsupported block size: ", block_size); \
+      break;                                                      \
+  }
+
+#define CALL_CUSTOM_LAUNCHER_BLK_HEAD_R(T, KVT, KV_DTYPE)         \
+  switch (head_size) {                                          \
+    case 64:                                                    \
+      CALL_CUSTOM_LAUNCHER_BLK_R(T, KVT, KV_DTYPE, 64);           \
+      break;                                                    \
+    case 128:                                                   \
+      CALL_CUSTOM_LAUNCHER_BLK_R(T, KVT, KV_DTYPE, 128);          \
+      break;                                                    \
+    default:                                                    \
+      TORCH_CHECK(false, "Unsupported head size: ", head_size); \
+      break;                                                    \
+  }
+
+void paged_reduction(
+    torch::Tensor& out,         // [num_seqs, num_heads, head_size]
+    torch::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
+    torch::Tensor& max_logits,  // [num_seqs, num_heads, max_num_partitions]
+    torch::Tensor&
+        tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
+    torch::Tensor& query,  // [num_seqs, num_heads, head_size]
+    torch::Tensor&
+        key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
+    torch::Tensor&
+        value_cache,  // [num_blocks, num_heads, head_size, block_size]
+    int64_t num_kv_heads, double scale,
+    torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
+    torch::Tensor& context_lens,  // [num_seqs]
+    torch::Tensor& xcd_exp_sums,  // [num_seqs]
+    torch::Tensor& xcd_max_logits,  // [num_seqs]
+    int64_t starscream_rank,
+    int64_t block_size, int64_t max_context_len,
+    const c10::optional<torch::Tensor>& alibi_slopes,
+    const std::string& kv_cache_dtype, double k_scale, double v_scale,
+    const c10::optional<torch::Tensor>& fp8_out_scale) {
+  const int head_size = query.size(2);
+  if (kv_cache_dtype == "auto") {
+    if (query.dtype() == at::ScalarType::Half) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD_R(_Float16, _Float16,
+                                    vllm::Fp8KVCacheDataType::kAuto);
+    } else if (query.dtype() == at::ScalarType::BFloat16) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD_R(__hip_bfloat16, __hip_bfloat16,
+                                    vllm::Fp8KVCacheDataType::kAuto);
+    } else {
+      TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+    }
+  } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
+    if (query.dtype() == at::ScalarType::Half) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD_R(_Float16, uint8_t,
+                                    vllm::Fp8KVCacheDataType::kFp8E4M3);
+    } else if (query.dtype() == at::ScalarType::BFloat16) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD_R(__hip_bfloat16, uint8_t,
                                     vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else {
       TORCH_CHECK(false, "Unsupported data type: ", query.dtype());

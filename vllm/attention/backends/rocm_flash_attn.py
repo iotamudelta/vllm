@@ -850,13 +850,15 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             modified_max_decode_seq_len = decode_meta.max_decode_seq_len // cpx_size
             decode_seq_len_offset = decode_meta.max_decode_seq_len % cpx_size
 ###### TBD This is a temporary hack; need to be examined
-#            decode_adder = min(1,decode_seq_len_offset)
-#            modified_max_decode_seq_len = modified_max_decode_seq_len + decode_adder
+            decode_adder = min(1,decode_seq_len_offset)
+            modified_max_decode_seq_len = modified_max_decode_seq_len + decode_adder
 ###### TBD This is a temporary hack; need to be examined
-            if(tp_rank%cpx_size < decode_seq_len_offset):
-                modified_max_decode_seq_len = modified_max_decode_seq_len + 1
-            context_len_desired = ((_PARTITION_SIZE_ROCM * cpx_size)-1) * cpx_size
-            modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, context_len_desired)
+#            if(tp_rank%cpx_size < decode_seq_len_offset):
+#                modified_max_decode_seq_len = modified_max_decode_seq_len + 1
+            starscream_rank = tp_rank%cpx_size
+
+#            context_len_desired = ((_PARTITION_SIZE_ROCM * cpx_size)-1) * cpx_size
+#            modified_seq_lens_tensor = torch.full_like(decode_meta.seq_lens_tensor, context_len_desired)
             outd = torch.empty_like(decode_query)
             output = torch.empty_like(dqt)
 
@@ -915,6 +917,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.encoder_seq_lens_tensor,
                     XCD_exp_sums,
                     XCD_max_logits,
+                    starscream_rank,
                     block_size,
                     max_seq_len,
                     self.alibi_slopes,
