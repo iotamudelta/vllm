@@ -292,6 +292,24 @@ class ROCmFlashAttentionMetadataBuilder(
 
     _metadata_cls = ROCmFlashAttentionMetadata
 
+@torch.jit.script
+def paged_reduct(inter_xcd_max_logit: torch.Tensor, XCD_max_logits: torch.Tensor, XCD_exp_sums: torch.Tensor, outd: torch.Tensor, cpx_total_num_heads: int) -> torch.Tensor:
+    max_logits_final = torch.max(inter_xcd_max_logit.view(inter_xcd_max_logit.shape[0], inter_xcd_max_logit.shape[1] // cpx_total_num_heads, cpx_total_num_heads), dim=1)[0]
+
+    delta_logits = XCD_max_logits - max_logits_final
+
+    alpha = torch.exp(delta_logits)
+
+    per_xcd_exp_sums = torch.mul(alpha, XCD_exp_sums)
+
+    per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
+
+    per_xcd_output = outd * per_xcd_exp_sums_expanded
+
+    concatenated_data = torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1)
+
+    return concatenated_data
+
 
 def _make_alibi_bias(alibi_slopes: torch.Tensor,
                      dtype: torch.dtype,
@@ -322,27 +340,6 @@ def _make_alibi_bias(alibi_slopes: torch.Tensor,
                 attn_biases.append(bias.to(dtype))
 
     return attn_biases
-
-
-@torch.jit.script
-#def paged_reduct(inter_xcd_max_logit: torch.Tensor, XCD_max_logits: torch.Tensor, cpx_total_num_heads: int):
-def paged_reduct(inter_xcd_max_logit: torch.Tensor, XCD_max_logits: torch.Tensor, XCD_exp_sums: torch.Tensor, outd: torch.Tensor, inter_xcd_max_logit_reordered: torch.Tensor, max_logits_final: torch.Tensor, delta_logits: torch.Tensor, cpx_total_num_heads: int, alpha: torch.Tensor, per_xcd_exp_sums: torch.Tensor, per_xcd_exp_sums_expanded: torch.Tensor, per_xcd_output: torch.Tensor, concatenated_data: torch.Tensor) -> torch.Tensor:
-    max_logits_final.copy_(torch.max(inter_xcd_max_logit.view(inter_xcd_max_logit.shape[0], inter_xcd_max_logit.shape[1] // cpx_total_num_heads, cpx_total_num_heads), dim=1)[0])
-
-    delta_logits.copy_(XCD_max_logits - max_logits_final)
-
-    alpha = torch.exp(delta_logits)
-
-    per_xcd_exp_sums = torch.mul(alpha, XCD_exp_sums)
-
-    per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
-
-    per_xcd_output = outd * per_xcd_exp_sums_expanded
-
-    concatenated_data = torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1)
-
-    return concatenated_data
-
 
 
 def _get_seq_len_block_table_args(
@@ -957,19 +954,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 # ******** CHANGES MADE ***********#
             # Inter-XCD Softmax aggregation code
             #   code to calculate inter-xcd m_i indicated by max_logits_final
-            inter_xcd_max_logit = torch.empty((*XCD_max_logits.shape[:-1], XCD_max_logits.shape[-1] * cpx_size), dtype=XCD_max_logits.dtype, device=output.device,)
-            inter_xcd_max_logit.copy_(cpx_model_parallel_all_gather(XCD_max_logits.contiguous()))
+            inter_xcd_max_logit = cpx_model_parallel_all_gather(XCD_max_logits.contiguous())
 
-            per_xcd_max_logit = tuple(torch.empty(inter_xcd_max_logit.shape[:-1] + (self.cpx_total_num_heads,), dtype=inter_xcd_max_logit.dtype, device=output.device) for _ in range(inter_xcd_max_logit.shape[1] // self.cpx_total_num_heads))
-            inter_xcd_max_logit_reordered = torch.empty((inter_xcd_max_logit.shape[0],inter_xcd_max_logit.shape[1] // self.cpx_total_num_heads, self.cpx_total_num_heads), dtype=inter_xcd_max_logit.dtype, device=output.device,)
-            max_logits_final = torch.empty_like(XCD_max_logits, device=output.device,)
-            delta_logits = torch.empty_like(XCD_max_logits, device=output.device,)
-            alpha = torch.empty_like(XCD_max_logits, device=output.device,)
-            per_xcd_exp_sums = torch.empty_like(XCD_exp_sums, device=output.device,)
-            per_xcd_exp_sums_expanded = torch.empty((*XCD_exp_sums.shape, 1), device=output.device,)
-            per_xcd_output = torch.empty_like(outd, device=output.device,)
-            concatenated_data = torch.empty(outd.shape[:-1] + (outd.shape[-1] + 1,), device=output.device)
-            concatenated_data = paged_reduct(inter_xcd_max_logit, XCD_max_logits, XCD_exp_sums, outd, inter_xcd_max_logit_reordered, max_logits_final, delta_logits, self.cpx_total_num_heads, alpha, per_xcd_exp_sums, per_xcd_exp_sums_expanded, per_xcd_output, concatenated_data)
+            concatenated_data = paged_reduct(inter_xcd_max_logit, XCD_max_logits, XCD_exp_sums, outd, self.cpx_total_num_heads)
 
             final_aggregated_data = torch.empty_like(concatenated_data, device=output.device,)
             final_aggregated_data.copy_(cpx_model_parallel_all_reduce(concatenated_data.contiguous()))
@@ -988,7 +975,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             splitted_final_output = [torch.empty_like(output, device=output.device,) for _ in range(cpx_size)]
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
             output.copy_(splitted_final_output[tp_rank%cpx_size].to(query.dtype))
-#           print(num_tokens, hidden_size, output.shape)
 
 # ******** CHANGES MADE ***********#
 
