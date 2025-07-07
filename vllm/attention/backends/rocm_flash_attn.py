@@ -293,22 +293,65 @@ class ROCmFlashAttentionMetadataBuilder(
     _metadata_cls = ROCmFlashAttentionMetadata
 
 @torch.jit.script
-def paged_reduct(inter_xcd_max_logit: torch.Tensor, XCD_max_logits: torch.Tensor, XCD_exp_sums: torch.Tensor, outd: torch.Tensor, cpx_total_num_heads: int) -> torch.Tensor:
-    max_logits_final = torch.max(inter_xcd_max_logit.view(inter_xcd_max_logit.shape[0], inter_xcd_max_logit.shape[1] // cpx_total_num_heads, cpx_total_num_heads), dim=1)[0]
+def paged_reduct(inter_xcd_max_logit: torch.Tensor, ## M_i
+                    inter_xcd_exp_sums: torch.Tensor,  ##L_i
+                    inter_xcd_outd: torch.Tensor,  ## O_i
+                    cpx_total_num_heads: int) -> torch.Tensor:
 
-    delta_logits = XCD_max_logits - max_logits_final
+    #fix view of AG tensors
+    all_XCD_logits = inter_xcd_max_logit.view(
+        inter_xcd_max_logit.shape[0],
+        inter_xcd_max_logit.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads
+    )
 
+    #same dim+sizes as M_i
+    all_XCD_exp_sums = inter_xcd_exp_sums.view(
+        inter_xcd_exp_sums.shape[0],
+        inter_xcd_exp_sums.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads
+    )
+    # review AG outd
+    # allgather in dim 1 instead of last dim -- fewer changes w.r.t. following compute
+    all_XCD_outd = inter_xcd_outd.view(
+        inter_xcd_outd.shape[0],
+        inter_xcd_outd.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads,
+        inter_xcd_outd.shape[2]
+    )
+
+    max_logits_final = torch.max(all_XCD_logits, dim=1)[0]
+
+    # expand is a view of original tensor.  tensor.repeat will return a new tensor
+    # -1 => don't change those dims
+    broadcast_max_logits_final = max_logits_final.unsqueeze(1)
+                                    .expand(-1,
+                                    max_logits_final.shape[1] // cpx_total_num_heads,
+                                    -1)
+
+
+    # shapes should match for the elt. subtraction
+    delta_logits = all_XCD_logits - broadcast_max_logits_final
+
+    # elt.wise op - no changes
     alpha = torch.exp(delta_logits)
 
-    per_xcd_exp_sums = torch.mul(alpha, XCD_exp_sums)
+    # torch.mul, '*' are elt. wise
+    per_xcd_exp_sums_offset = torch.mul(alpha, all_XCD_exp_sums)
 
-    per_xcd_exp_sums_expanded = per_xcd_exp_sums.unsqueeze(-1)
+    per_xcd_exp_sums_expanded = per_xcd_exp_sums_offset.unsqueeze(-1)
 
-    per_xcd_output = outd * per_xcd_exp_sums_expanded
+    all_xcd_output = all_XCD_outd * per_xcd_exp_sums_expanded
 
-    concatenated_data = torch.cat((per_xcd_output, per_xcd_exp_sums_expanded), dim=-1)
+    #### last stretch
+    # add O_* and L_*
+    added_all_xcd_output = torch.sum(all_xcd_output, dim=1)
+    added_all_xcd_exp_sums = torch.sum(per_xcd_exp_sums_expanded, dim=1)
 
-    return concatenated_data
+    # divide
+    outputs = added_all_xcd_output / added_all_xcd_exp_sums
+
+    return outputs
 
 
 def _make_alibi_bias(alibi_slopes: torch.Tensor,
@@ -958,22 +1001,10 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             # Inter-XCD Softmax aggregation code
             #   code to calculate inter-xcd m_i indicated by max_logits_final
             inter_xcd_max_logit = cpx_model_parallel_all_gather(XCD_max_logits.contiguous())
+            inter_xcd_exp_sums = cpx_model_parallel_all_gather(XCD_exp_sums.contiguous())
+            inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
 
-            concatenated_data = paged_reduct(inter_xcd_max_logit, XCD_max_logits, XCD_exp_sums, outd, self.cpx_total_num_heads)
-
-            final_aggregated_data = torch.empty_like(concatenated_data, device=output.device,)
-            final_aggregated_data.copy_(cpx_model_parallel_all_reduce(concatenated_data.contiguous()))
-            last_dim = final_aggregated_data.shape[-1]
-            oa_size = last_dim - 1
-
-            output_aggregated = torch.empty((outd.shape[:-1] + (outd.shape[-1],)), device=output.device,)
-            exp_sums_final_expanded = torch.empty((outd.shape[:-1] + (1,)), device=output.device,)
-            output_aggregated.copy_(torch.split(final_aggregated_data, [oa_size, 1], dim=-1)[0])
-            exp_sums_final_expanded.copy_(torch.split(final_aggregated_data, [oa_size, 1], dim=-1)[1])
-
-            # code to calculate the final output
-            final_output = torch.empty_like(outd, device=output.device,)
-            final_output.copy_(output_aggregated / exp_sums_final_expanded)
+            final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, self.cpx_total_num_heads)
 
             splitted_final_output = [torch.empty_like(output, device=output.device,) for _ in range(cpx_size)]
             splitted_final_output = final_output.chunk(cpx_size, dim=1)
