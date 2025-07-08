@@ -324,10 +324,7 @@ def paged_reduct(inter_xcd_max_logit: torch.Tensor, ## M_i
 
     # expand is a view of original tensor.  tensor.repeat will return a new tensor
     # -1 => don't change those dims
-    broadcast_max_logits_final = max_logits_final.unsqueeze(1)
-                                    .expand(-1,
-                                    max_logits_final.shape[1] // cpx_total_num_heads,
-                                    -1)
+    broadcast_max_logits_final = max_logits_final.unsqueeze(1).expand(-1, max_logits_final.shape[1] // cpx_total_num_heads, -1)
 
 
     # shapes should match for the elt. subtraction
